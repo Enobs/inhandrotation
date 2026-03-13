@@ -1,0 +1,21 @@
+<robot name="root">
+  <link name="link_original">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="utah_teapot.stl" scale="1.0000E+00 1.0000E+00 1.0000E+00"/>
+      </geometry>
+    </visual>
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <inertia ixx="1.39E-03" ixy="7.24E-08" ixz="2.81E-06" iyy="1.68E-03" iyz="-7.87E-08" izz="2.13E-03"/>
+    </inertial>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="coacd_allinone.obj" scale="1.0000E+00 1.0000E+00 1.0000E+00"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="link_original"/>
+</robot>

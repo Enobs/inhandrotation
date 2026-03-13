@@ -1,0 +1,21 @@
+<robot name="root">
+  <link name="link_original">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="train.stl" scale="1.0000E+00 1.0000E+00 1.0000E+00"/>
+      </geometry>
+    </visual>
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <inertia ixx="1.13E-04" ixy="7.69E-12" ixz="-1.98E-05" iyy="2.15E-04" iyz="3.08E-12" izz="1.69E-04"/>
+    </inertial>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="coacd_allinone.obj" scale="1.0000E+00 1.0000E+00 1.0000E+00"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="link_original"/>
+</robot>

@@ -1,0 +1,21 @@
+<robot name="root">
+  <link name="link_original">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="mini_soccer_ball.stl" scale="1.0000E+00 1.0000E+00 1.0000E+00"/>
+      </geometry>
+    </visual>
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <inertia ixx="1.66E-03" ixy="1.04E-05" ixz="1.78E-05" iyy="1.66E-03" iyz="3.63E-05" izz="1.66E-03"/>
+    </inertial>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="coacd_allinone.obj" scale="1.0000E+00 1.0000E+00 1.0000E+00"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="link_original"/>
+</robot>
