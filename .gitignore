@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+
+# Isaac Sim generated USD cache
+tasks/wuji_inhand_rotation/usd/
+data_urdf/**/*/configuration/
+data_urdf/**/*/*.usd
+
+# Logs and checkpoints
+logs/
+*.pt
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Misc
+*.stl.bak
+*.usd.bak

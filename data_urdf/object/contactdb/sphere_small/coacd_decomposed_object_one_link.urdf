@@ -1,0 +1,21 @@
+<robot name="sphere_small">
+  <link name="object">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="sphere_small.stl" scale="1.0000E+00 1.0000E+00 1.0000E+00"/>
+      </geometry>
+    </visual>
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="0.05"/>
+      <inertia ixx="5.27E-06" ixy="9.07E-12" ixz="-1.32E-11" iyy="5.27E-06" iyz="8.75E-12" izz="5.53E-06"/>
+    </inertial>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="coacd_allinone.obj" scale="1.0000E+00 1.0000E+00 1.0000E+00"/>
+      </geometry>
+    </collision>
+  </link>
+</robot>

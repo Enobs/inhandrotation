@@ -1,0 +1,21 @@
+<robot name="sphere_tennis">
+  <link name="object">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="sphere_tennis.stl" scale="1.0000E+00 1.0000E+00 1.0000E+00"/>
+      </geometry>
+    </visual>
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="0.057"/>
+      <inertia ixx="2.96E-05" ixy="0" ixz="0" iyy="2.96E-05" iyz="0" izz="2.96E-05"/>
+    </inertial>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="coacd_allinone.obj" scale="1.0000E+00 1.0000E+00 1.0000E+00"/>
+      </geometry>
+    </collision>
+  </link>
+</robot>
