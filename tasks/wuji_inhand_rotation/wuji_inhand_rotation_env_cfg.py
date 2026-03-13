@@ -118,7 +118,7 @@ class WujiInHandRotationEnvCfg(DirectRLEnvCfg):
                 solver_velocity_iteration_count=0,
                 sleep_threshold=0.005,
                 stabilization_threshold=0.0025,
-                max_depenetration_velocity=1.0,
+                max_depenetration_velocity=0.5,
             ),
             mass_props=sim_utils.MassPropertiesCfg(density=100.0),
         ),
@@ -126,7 +126,7 @@ class WujiInHandRotationEnvCfg(DirectRLEnvCfg):
             # Sphere placed inside the finger cage, above palm center
             # Palm is at z=0.5, fingers extend ~0.09m in +Z
             # With curled fingers, sphere center should be ~0.06-0.08m above palm
-            pos=(-0.105, -0.0034, 0.58),
+            pos=(-0.095, -0.0084, 0.56),
             rot=(1.0, 0.0, 0.0, 0.0),
         ),
     )

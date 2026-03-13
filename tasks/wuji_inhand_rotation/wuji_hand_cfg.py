@@ -65,7 +65,7 @@ _SPAWN_CFG = sim_utils.UrdfFileCfg(
         angular_damping=0.0,
         max_linear_velocity=1000.0,
         max_angular_velocity=1000.0,
-        max_depenetration_velocity=10.0,
+        max_depenetration_velocity=1.0,
     ),
     articulation_props=sim_utils.ArticulationRootPropertiesCfg(
         enabled_self_collisions=False,
@@ -117,32 +117,32 @@ WUJI_HAND_GRASP_CFG = ArticulationCfg(
             # Thumb (finger1): curled inward to oppose other fingers
             f"{_SIDE}_finger1_joint1": 0.8464847,
             f"{_SIDE}_finger1_joint2": -0.0554,
-            f"{_SIDE}_finger1_joint3": 0.9669124,
-            f"{_SIDE}_finger1_joint4": 0.13439,
+            f"{_SIDE}_finger1_joint3": 0.90,
+            f"{_SIDE}_finger1_joint4": 0.20,
             
             # Fingers 2: curled to form a cage around the sphere
             f"{_SIDE}_finger2_joint1": 0.9058259,
             f"{_SIDE}_finger2_joint2": 0.1867502,
-            f"{_SIDE}_finger2_joint3": 0.3263766,
-            f"{_SIDE}_finger2_joint4": 0.413643,
+            f"{_SIDE}_finger2_joint3": 0.25,
+            f"{_SIDE}_finger2_joint4": 0.33,
             
             # Fingers 3: curled to form a cage around the sphere
             f"{_SIDE}_finger3_joint1": 1.251401,
             f"{_SIDE}_finger3_joint2": 0.0,
-            f"{_SIDE}_finger3_joint3": 0.4066617,
-            f"{_SIDE}_finger3_joint4": 0.2897247,
+            f"{_SIDE}_finger3_joint3": 0.33,
+            f"{_SIDE}_finger3_joint4": 0.21,
             
             # Fingers 4: curled to form a cage around the sphere
             f"{_SIDE}_finger4_joint1": 1.176352,
             f"{_SIDE}_finger4_joint2": -0.00523599,
-            f"{_SIDE}_finger4_joint3": 0.715585,
-            f"{_SIDE}_finger4_joint4": 0.2234021,
+            f"{_SIDE}_finger4_joint3": 0.64,
+            f"{_SIDE}_finger4_joint4": 0.15,
             
             # Fingers 5: curled to form a cage around the sphere
             f"{_SIDE}_finger5_joint1": 1.363102,
             f"{_SIDE}_finger5_joint2": 0.010472,
-            f"{_SIDE}_finger5_joint3": 1.214749,
-            f"{_SIDE}_finger5_joint4": 0.1309,
+            f"{_SIDE}_finger5_joint3": 1.15,
+            f"{_SIDE}_finger5_joint4": 0.20,
         },
     ),
     actuators=_ACTUATORS,

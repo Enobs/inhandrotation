@@ -237,9 +237,13 @@ class WujiInHandRotationEnv(DirectRLEnv):
         dof_pos = torch.min(dof_pos, self.hand_dof_upper_limits[env_ids])
 
         self.hand.write_joint_state_to_sim(dof_pos, default_dof_vel, env_ids=env_ids)
-        self.hand.set_joint_position_target(dof_pos, env_ids=env_ids)
-        self.prev_targets[env_ids] = dof_pos
-        self.cur_targets[env_ids] = dof_pos
+
+        # Set PD target to grasp_ref_pos (with squeeze) so fingers close around ball
+        grasp_targets = dof_pos.clone()
+        grasp_targets[:, self.actuated_dof_indices] = self.grasp_ref_pos[env_ids]
+        self.hand.set_joint_position_target(grasp_targets, env_ids=env_ids)
+        self.prev_targets[env_ids] = grasp_targets
+        self.cur_targets[env_ids] = grasp_targets
 
         # ---- Reset object to palm-center + noise ----
         object_default_state = self.object.data.default_root_state[env_ids].clone()
