@@ -126,7 +126,7 @@ class WujiInHandRotationEnvCfg(DirectRLEnvCfg):
             # Sphere placed inside the finger cage, above palm center
             # Palm is at z=0.5, fingers extend ~0.09m in +Z
             # With curled fingers, sphere center should be ~0.06-0.08m above palm
-            pos=(-0.095, -0.0084, 0.56),
+            pos=(-0.095, -0.00, 0.56),
             rot=(1.0, 0.0, 0.0, 0.0),
         ),
     )
@@ -149,16 +149,18 @@ class WujiInHandRotationEnvCfg(DirectRLEnvCfg):
     reset_object_pos_noise = 0.0  # noise range for object position at reset (disabled for debugging)
 
     # ----- reward scales (modular, easy to tune) -----
+    # Positive reward for keeping the ball each step (survival bonus)
+    rew_hold_bonus = 0.5
     # Rotation tracking: reward angular velocity along target axis
-    rew_rotation_scale = 2.0
+    rew_rotation_scale = 5.0
     # Penalize angular velocity on non-target axes
-    rew_non_target_rotation_penalty = -0.5
+    rew_non_target_rotation_penalty = -0.1
     # Penalize object falling / distance from palm
-    rew_object_drop_penalty = -10.0
+    rew_object_drop_penalty = -2.0
     # Penalize large actions (energy)
-    rew_action_penalty = -0.001
+    rew_action_penalty = -0.05
     # Penalize deviation from reference grasp pose
-    rew_pose_deviation_penalty = -0.05
+    rew_pose_deviation_penalty = -0.01
     # Penalize large joint velocities (smoothness)
     rew_joint_vel_penalty = -0.001
 

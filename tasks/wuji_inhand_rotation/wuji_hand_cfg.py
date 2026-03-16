@@ -22,9 +22,9 @@ _SIDE = "right"
 
 # PD control gains (per-joint tuning)
 _KP = {
-    f"{_SIDE}_finger(1|2|3|4|5)_joint(1|2)": 50.0,
-    f"{_SIDE}_finger(1|2|3|4|5)_joint3": 30.0,
-    f"{_SIDE}_finger(1|2|3|4|5)_joint4": 20.0,
+    f"{_SIDE}_finger(1|2|3|4|5)_joint(1|2)": 100.0,
+    f"{_SIDE}_finger(1|2|3|4|5)_joint3": 60.0,
+    f"{_SIDE}_finger(1|2|3|4|5)_joint4": 40.0,
 }
 _KD = {
     f"{_SIDE}_finger.*_joint(1|2)": 1.0,
@@ -129,23 +129,51 @@ WUJI_HAND_GRASP_CFG = ArticulationCfg(
             # Fingers 3: curled to form a cage around the sphere
             f"{_SIDE}_finger3_joint1": 1.251401,
             f"{_SIDE}_finger3_joint2": 0.0,
-            f"{_SIDE}_finger3_joint3": 0.33,
-            f"{_SIDE}_finger3_joint4": 0.21,
+            f"{_SIDE}_finger3_joint3": 0.05,
+            f"{_SIDE}_finger3_joint4": 0.0,
             
             # Fingers 4: curled to form a cage around the sphere
             f"{_SIDE}_finger4_joint1": 1.176352,
             f"{_SIDE}_finger4_joint2": -0.00523599,
-            f"{_SIDE}_finger4_joint3": 0.64,
-            f"{_SIDE}_finger4_joint4": 0.15,
+            f"{_SIDE}_finger4_joint3": 0.30,
+            f"{_SIDE}_finger4_joint4": 0.0,
             
             # Fingers 5: curled to form a cage around the sphere
             f"{_SIDE}_finger5_joint1": 1.363102,
             f"{_SIDE}_finger5_joint2": 0.010472,
-            f"{_SIDE}_finger5_joint3": 1.15,
-            f"{_SIDE}_finger5_joint4": 0.20,
+            f"{_SIDE}_finger5_joint3": 1.00,
+            f"{_SIDE}_finger5_joint4": 0.10,
         },
     ),
     actuators=_ACTUATORS,
     soft_joint_pos_limit_factor=1.0,
 )
 """Configuration of Wuji Hand robot (grasp pose for in-hand manipulation)."""
+
+##
+# Grasp target joint positions (tighter than init — PD drives toward these to grip the ball)
+# These are the original GUI-tuned values where fingers contact the ball.
+##
+WUJI_GRASP_TARGET_JOINT_POS = {
+    f"{_SIDE}_finger1_joint1": 0.8464847,
+    f"{_SIDE}_finger1_joint2": -0.0554,
+    f"{_SIDE}_finger1_joint3": 0.90,
+    f"{_SIDE}_finger1_joint4": 0.20,
+    f"{_SIDE}_finger2_joint1": 1.0058259,
+    f"{_SIDE}_finger2_joint2": 0.1867502,
+    f"{_SIDE}_finger2_joint3": 0.25,
+    f"{_SIDE}_finger2_joint4": 0.33,
+    f"{_SIDE}_finger3_joint1": 1.251401,
+    f"{_SIDE}_finger3_joint2": 0.0,
+    f"{_SIDE}_finger3_joint3": 0.33,
+    f"{_SIDE}_finger3_joint4": 0.21,
+    f"{_SIDE}_finger4_joint1": 1.176352,
+    f"{_SIDE}_finger4_joint2": -0.00523599,
+    f"{_SIDE}_finger4_joint3": 0.64,
+    f"{_SIDE}_finger4_joint4": 0.15,
+    f"{_SIDE}_finger5_joint1": 1.363102,
+    f"{_SIDE}_finger5_joint2": 0.010472,
+    f"{_SIDE}_finger5_joint3": 1.15,
+    f"{_SIDE}_finger5_joint4": 0.20,
+}
+"""Grasp target positions: original tight values for PD grip force."""

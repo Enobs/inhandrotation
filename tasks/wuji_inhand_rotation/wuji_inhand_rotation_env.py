@@ -16,6 +16,7 @@ from isaaclab.envs import DirectRLEnv
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.utils.math import sample_uniform, saturate
 
+from .wuji_hand_cfg import WUJI_GRASP_TARGET_JOINT_POS
 from .wuji_inhand_rotation_env_cfg import WujiInHandRotationEnvCfg
 
 
@@ -60,15 +61,26 @@ class WujiInHandRotationEnv(DirectRLEnv):
         self.actions = torch.zeros((self.num_envs, self.num_actuated), device=self.device)
         self.prev_actions = torch.zeros((self.num_envs, self.num_actuated), device=self.device)
 
-        # Reference grasp pose (default + squeeze offset to create grip force)
-        # Fingers target slightly more closed than contact → PD error = grip force
-        self.grasp_ref_pos = self.hand.data.default_joint_pos[:, self.actuated_dof_indices].clone() + 0.05
+        # Reference grasp pose: two separate poses
+        # - grasp_base_pos = init_state (open, no penetration)
+        # - grasp_ref_pos  = original tight values (PD target for grip force)
+        # Warmup ramps from base → ref over first N steps to avoid penetration
+        self.squeeze_warmup_steps = 30  # ramp over this many env steps after reset
+        self.grasp_base_pos = self.hand.data.default_joint_pos[:, self.actuated_dof_indices].clone()
+
+        # Build grasp_ref_pos from the separate target dict
+        grasp_target = self.grasp_base_pos.clone()
+        for joint_name, target_val in WUJI_GRASP_TARGET_JOINT_POS.items():
+            if joint_name in self.hand.joint_names:
+                joint_idx = self.hand.joint_names.index(joint_name)
+                if joint_idx in self.actuated_dof_indices:
+                    local_idx = self.actuated_dof_indices.index(joint_idx)
+                    grasp_target[:, local_idx] = target_val
+        self.grasp_ref_pos = grasp_target
 
         # Object initial position in env-local coordinates (for drop detection)
-        # default_root_state is in world frame, so subtract env_origins
-        self.object_init_pos_local = (
-            self.object.data.default_root_state[:, :3] - self.scene.env_origins
-        ).clone()
+        # default_root_state is already in local (env) frame, NOT world frame
+        self.object_init_pos_local = self.object.data.default_root_state[:, :3].clone()
 
         # Target rotation axis (normalized, in world frame since hand is fixed)
         axis = torch.tensor(self.cfg.target_rotation_axis, dtype=torch.float32, device=self.device)
@@ -100,8 +112,14 @@ class WujiInHandRotationEnv(DirectRLEnv):
         self.actions = actions.clone().clamp(-1.0, 1.0)
 
     def _apply_action(self) -> None:
+        # Ramp from open init pose to tight grasp pose over warmup period
+        warmup_frac = torch.clamp(
+            self.episode_length_buf.float() / self.squeeze_warmup_steps, 0.0, 1.0
+        ).unsqueeze(-1)  # (N, 1)
+        current_grasp_ref = self.grasp_base_pos + (self.grasp_ref_pos - self.grasp_base_pos) * warmup_frac
+
         # Absolute position control: grasp_ref + action * scale
-        desired = self.grasp_ref_pos + self.actions * self.cfg.action_scale
+        desired = current_grasp_ref + self.actions * self.cfg.action_scale
 
         # Apply EMA smoothing
         self.cur_targets[:, self.actuated_dof_indices] = (
@@ -176,6 +194,7 @@ class WujiInHandRotationEnv(DirectRLEnv):
             hand_dof_vel_actuated=self.hand_dof_vel[:, self.actuated_dof_indices],
             fall_dist=self.cfg.fall_dist,
             # scales
+            rew_hold_bonus=self.cfg.rew_hold_bonus,
             rew_rotation_scale=self.cfg.rew_rotation_scale,
             rew_non_target_rotation_penalty=self.cfg.rew_non_target_rotation_penalty,
             rew_object_drop_penalty=self.cfg.rew_object_drop_penalty,
@@ -238,9 +257,9 @@ class WujiInHandRotationEnv(DirectRLEnv):
 
         self.hand.write_joint_state_to_sim(dof_pos, default_dof_vel, env_ids=env_ids)
 
-        # Set PD target to grasp_ref_pos (with squeeze) so fingers close around ball
+        # Set PD target to base grasp pos (NO squeeze yet — warmup ramps it in)
         grasp_targets = dof_pos.clone()
-        grasp_targets[:, self.actuated_dof_indices] = self.grasp_ref_pos[env_ids]
+        grasp_targets[:, self.actuated_dof_indices] = self.grasp_base_pos[env_ids]
         self.hand.set_joint_position_target(grasp_targets, env_ids=env_ids)
         self.prev_targets[env_ids] = grasp_targets
         self.cur_targets[env_ids] = grasp_targets
@@ -263,6 +282,23 @@ class WujiInHandRotationEnv(DirectRLEnv):
         # ---- Reset action buffers ----
         self.actions[env_ids] = 0.0
         self.prev_actions[env_ids] = 0.0
+
+        # Debug: print init state on first reset for env 0
+        if 0 in env_ids and not getattr(self, "_init_debug_printed", False):
+            self._init_debug_printed = True
+            idx = 0
+            print("\n" + "=" * 70)
+            print("[DEBUG] Init state for env 0:")
+            print(f"  Hand init joint pos (actuated): {dof_pos[idx, self.actuated_dof_indices].cpu().tolist()}")
+            print(f"  Grasp ref pos (PD target):      {self.grasp_ref_pos[idx].cpu().tolist()}")
+            print(f"  Squeeze offset:                 {(self.grasp_ref_pos[idx] - dof_pos[idx, self.actuated_dof_indices]).mean().item():.4f} rad")
+            obj_pos = object_default_state[idx, :3].cpu().tolist()
+            env_origin = self.scene.env_origins[idx].cpu().tolist()
+            local_pos = [obj_pos[i] - env_origin[i] for i in range(3)]
+            print(f"  Object world pos: {obj_pos}")
+            print(f"  Object local pos: {local_pos}")
+            print(f"  Object init ref:  {self.object_init_pos_local[idx].cpu().tolist()}")
+            print("=" * 70 + "\n")
 
     # ------------------------------------------------------------------ #
     # Helpers
@@ -302,6 +338,7 @@ def _compute_rewards(
     grasp_ref_pos: torch.Tensor,
     hand_dof_vel_actuated: torch.Tensor,
     fall_dist: float,
+    rew_hold_bonus: float,
     rew_rotation_scale: float,
     rew_non_target_rotation_penalty: float,
     rew_object_drop_penalty: float,
@@ -321,13 +358,11 @@ def _compute_rewards(
     angvel_off_axis = object_angvel - angvel_on_axis.unsqueeze(-1) * target_axis
     non_target_penalty = rew_non_target_rotation_penalty * torch.norm(angvel_off_axis, dim=-1)
 
-    # 3. Object drop penalty
+    # 3. Object drop penalty (smooth: grows as object drifts from init pos)
     dist_from_init = torch.norm(object_pos_local - object_init_pos_local, dim=-1)
-    drop_penalty = torch.where(
-        dist_from_init > fall_dist * 0.8,
-        torch.full_like(dist_from_init, rew_object_drop_penalty),
-        torch.zeros_like(dist_from_init),
-    )
+    # Normalized distance [0, 1] relative to fall threshold
+    dist_normalized = torch.clamp(dist_from_init / (fall_dist + 1e-6), min=0.0, max=1.0)
+    drop_penalty = rew_object_drop_penalty * dist_normalized * dist_normalized
 
     # 4. Action magnitude penalty (energy regularization)
     action_penalty = rew_action_penalty * torch.sum(actions ** 2, dim=-1)
@@ -340,8 +375,12 @@ def _compute_rewards(
     # 6. Joint velocity penalty (smoothness)
     joint_vel_penalty = rew_joint_vel_penalty * torch.sum(hand_dof_vel_actuated ** 2, dim=-1)
 
+    # 7. Hold bonus: constant positive reward for keeping the ball
+    hold_bonus = rew_hold_bonus * torch.ones_like(rotation_reward)
+
     total_reward = (
-        rotation_reward
+        hold_bonus
+        + rotation_reward
         + non_target_penalty
         + drop_penalty
         + action_penalty

@@ -88,7 +88,15 @@ def main():
     env = RslRlVecEnvWrapper(env)
 
     # ---- Create runner ----
-    runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
+    # Build config dict and strip deprecated fields that rsl-rl >= 5.0 doesn't accept
+    train_cfg = agent_cfg.to_dict()
+    _DEPRECATED = {"stochastic", "init_noise_std", "noise_std_type", "state_dependent_std"}
+    for key in ("actor", "critic"):
+        if key in train_cfg:
+            for dep in _DEPRECATED:
+                train_cfg[key].pop(dep, None)
+
+    runner = OnPolicyRunner(env, train_cfg, log_dir=log_dir, device=agent_cfg.device)
 
     # Resume if requested
     if args_cli.resume:
@@ -109,7 +117,7 @@ def main():
             runner.load(resume_path)
 
     # ---- Train ----
-    runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
+    runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=False)
 
     # Cleanup
     env.close()
