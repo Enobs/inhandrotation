@@ -6,6 +6,7 @@ IMCopilot-style atomic skill: stable grasp + continuous rotation.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 
 import torch
@@ -81,6 +82,25 @@ class WujiInHandRotationEnv(DirectRLEnv):
         # Object initial position in env-local coordinates (for drop detection)
         # default_root_state is already in local (env) frame, NOT world frame
         self.object_init_pos_local = self.object.data.default_root_state[:, :3].clone()
+
+        # Build per-actuated-joint Kp and Kd vectors for torque estimation
+        # (implicit actuator: PhysX handles PD internally, so we estimate torque = Kp*pos_err - Kd*vel)
+        from .wuji_hand_cfg import _KP, _KD
+        self.kp_vec = torch.zeros(self.num_actuated, device=self.device)
+        self.kd_vec = torch.zeros(self.num_actuated, device=self.device)
+        for local_idx, joint_idx in enumerate(self.actuated_dof_indices):
+            joint_name = self.hand.joint_names[joint_idx]
+            for pattern, kp_val in _KP.items():
+                if re.match(pattern, joint_name):
+                    self.kp_vec[local_idx] = kp_val
+                    break
+            for pattern, kd_val in _KD.items():
+                if re.match(pattern, joint_name):
+                    self.kd_vec[local_idx] = kd_val
+                    break
+        # Expand to (1, num_actuated) for broadcasting
+        self.kp_vec = self.kp_vec.unsqueeze(0)
+        self.kd_vec = self.kd_vec.unsqueeze(0)
 
         # Target rotation axis (normalized, in world frame since hand is fixed)
         axis = torch.tensor(self.cfg.target_rotation_axis, dtype=torch.float32, device=self.device)
@@ -182,26 +202,37 @@ class WujiInHandRotationEnv(DirectRLEnv):
     # ------------------------------------------------------------------ #
 
     def _get_rewards(self) -> torch.Tensor:
-        return _compute_rewards(
+        # Estimate PD torque: τ = Kp*(target - pos) - Kd*vel
+        pos_error = self.cur_targets[:, self.actuated_dof_indices] - self.hand_dof_pos[:, self.actuated_dof_indices]
+        vel = self.hand_dof_vel[:, self.actuated_dof_indices]
+        estimated_torque = self.kp_vec * pos_error - self.kd_vec * vel
+
+        total, components = _compute_rewards(
             object_angvel=self.object_angvel,
+            object_linvel=self.object_linvel,
             target_axis=self.target_axis,
             target_angular_velocity=self.cfg.target_angular_velocity,
-            object_pos_local=self.object_pos_local,
-            object_init_pos_local=self.object_init_pos_local,
-            actions=self.actions,
             hand_dof_pos_actuated=self.hand_dof_pos[:, self.actuated_dof_indices],
             grasp_ref_pos=self.grasp_ref_pos,
-            hand_dof_vel_actuated=self.hand_dof_vel[:, self.actuated_dof_indices],
-            fall_dist=self.cfg.fall_dist,
-            # scales
-            rew_hold_bonus=self.cfg.rew_hold_bonus,
+            hand_dof_vel_actuated=vel,
+            estimated_torque=estimated_torque,
+            # scales (IMCopilot: r_rot, r_vel, r_work, r_torq, r_diff)
             rew_rotation_scale=self.cfg.rew_rotation_scale,
-            rew_non_target_rotation_penalty=self.cfg.rew_non_target_rotation_penalty,
-            rew_object_drop_penalty=self.cfg.rew_object_drop_penalty,
-            rew_action_penalty=self.cfg.rew_action_penalty,
+            rew_vel_penalty=self.cfg.rew_vel_penalty,
+            rew_work_penalty=self.cfg.rew_work_penalty,
+            rew_torque_penalty=self.cfg.rew_torque_penalty,
             rew_pose_deviation_penalty=self.cfg.rew_pose_deviation_penalty,
-            rew_joint_vel_penalty=self.cfg.rew_joint_vel_penalty,
         )
+        # Log reward components to extras for tensorboard
+        self.extras["log"] = {
+            "rew_rotation": components[0].mean(),
+            "rew_vel_penalty": components[1].mean(),
+            "rew_work_penalty": components[2].mean(),
+            "rew_torque_penalty": components[3].mean(),
+            "rew_pose_deviation": components[4].mean(),
+            "angvel_on_axis": components[5].mean(),
+        }
+        return total
 
     # ------------------------------------------------------------------ #
     # Terminations
@@ -329,63 +360,51 @@ def _unscale(x: torch.Tensor, lower: torch.Tensor, upper: torch.Tensor) -> torch
 @torch.jit.script
 def _compute_rewards(
     object_angvel: torch.Tensor,
+    object_linvel: torch.Tensor,
     target_axis: torch.Tensor,
     target_angular_velocity: float,
-    object_pos_local: torch.Tensor,
-    object_init_pos_local: torch.Tensor,
-    actions: torch.Tensor,
     hand_dof_pos_actuated: torch.Tensor,
     grasp_ref_pos: torch.Tensor,
     hand_dof_vel_actuated: torch.Tensor,
-    fall_dist: float,
-    rew_hold_bonus: float,
+    estimated_torque: torch.Tensor,
     rew_rotation_scale: float,
-    rew_non_target_rotation_penalty: float,
-    rew_object_drop_penalty: float,
-    rew_action_penalty: float,
+    rew_vel_penalty: float,
+    rew_work_penalty: float,
+    rew_torque_penalty: float,
     rew_pose_deviation_penalty: float,
-    rew_joint_vel_penalty: float,
-) -> torch.Tensor:
-    """Compute modular reward for in-hand rotation."""
+) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    """Compute reward for in-hand rotation (IMCopilot paper: r_rot + r_vel + r_work + r_torq + r_diff)."""
 
-    # 1. Rotation reward: angular velocity projected onto target axis
-    #    Positive if rotating in the correct direction
+    # 1. r_rot: rotation reward — angular velocity projected onto target axis
     angvel_on_axis = torch.sum(object_angvel * target_axis, dim=-1)  # (N,)
-    # Reward = how close to desired angular velocity
     rotation_reward = rew_rotation_scale * torch.clamp(angvel_on_axis / (target_angular_velocity + 1e-6), min=-1.0, max=2.0)
 
-    # 2. Non-target rotation penalty: angular velocity off the target axis
-    angvel_off_axis = object_angvel - angvel_on_axis.unsqueeze(-1) * target_axis
-    non_target_penalty = rew_non_target_rotation_penalty * torch.norm(angvel_off_axis, dim=-1)
+    # 2. r_vel: object linear velocity penalty (object should stay still, only rotate)
+    vel_penalty = rew_vel_penalty * torch.sum(object_linvel ** 2, dim=-1)
 
-    # 3. Object drop penalty (smooth: grows as object drifts from init pos)
-    dist_from_init = torch.norm(object_pos_local - object_init_pos_local, dim=-1)
-    # Normalized distance [0, 1] relative to fall threshold
-    dist_normalized = torch.clamp(dist_from_init / (fall_dist + 1e-6), min=0.0, max=1.0)
-    drop_penalty = rew_object_drop_penalty * dist_normalized * dist_normalized
+    # 3. r_work: joint work/power penalty = |torque * velocity|
+    joint_work = torch.abs(estimated_torque * hand_dof_vel_actuated)
+    work_penalty = rew_work_penalty * torch.sum(joint_work, dim=-1)
 
-    # 4. Action magnitude penalty (energy regularization)
-    action_penalty = rew_action_penalty * torch.sum(actions ** 2, dim=-1)
+    # 4. r_torq: joint torque penalty
+    torque_penalty = rew_torque_penalty * torch.sum(estimated_torque ** 2, dim=-1)
 
-    # 5. Pose deviation penalty (stay near grasp reference)
+    # 5. r_diff: pose deviation penalty (stay near grasp reference)
     pose_deviation = rew_pose_deviation_penalty * torch.sum(
         (hand_dof_pos_actuated - grasp_ref_pos) ** 2, dim=-1
     )
 
-    # 6. Joint velocity penalty (smoothness)
-    joint_vel_penalty = rew_joint_vel_penalty * torch.sum(hand_dof_vel_actuated ** 2, dim=-1)
-
-    # 7. Hold bonus: constant positive reward for keeping the ball
-    hold_bonus = rew_hold_bonus * torch.ones_like(rotation_reward)
-
     total_reward = (
-        hold_bonus
-        + rotation_reward
-        + non_target_penalty
-        + drop_penalty
-        + action_penalty
+        rotation_reward
+        + vel_penalty
+        + work_penalty
+        + torque_penalty
         + pose_deviation
-        + joint_vel_penalty
     )
 
-    return total_reward
+    components: list[torch.Tensor] = [
+        rotation_reward, vel_penalty, work_penalty, torque_penalty,
+        pose_deviation, angvel_on_axis,
+    ]
+
+    return total_reward, components

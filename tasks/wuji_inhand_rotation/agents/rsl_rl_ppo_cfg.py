@@ -14,7 +14,7 @@ class WujiInHandRotationPPORunnerCfg(RslRlOnPolicyRunnerCfg):
 
     num_steps_per_env = 16
     max_iterations = 10000
-    save_interval = 2000
+    save_interval = 1000
     experiment_name = "wuji_inhand_rotation"
     run_name = ""
     logger = "tensorboard"

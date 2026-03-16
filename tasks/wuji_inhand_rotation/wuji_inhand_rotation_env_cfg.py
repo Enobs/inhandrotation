@@ -148,21 +148,17 @@ class WujiInHandRotationEnvCfg(DirectRLEnvCfg):
     reset_dof_pos_noise = 0.0  # noise range for finger joints at reset (disabled for debugging)
     reset_object_pos_noise = 0.0  # noise range for object position at reset (disabled for debugging)
 
-    # ----- reward scales (modular, easy to tune) -----
-    # Positive reward for keeping the ball each step (survival bonus)
-    rew_hold_bonus = 0.5
-    # Rotation tracking: reward angular velocity along target axis
+    # ----- reward scales (IMCopilot paper: r_rot + r_vel + r_work + r_torq + r_diff) -----
+    # r_rot: rotation tracking reward (angular velocity along target axis)
     rew_rotation_scale = 5.0
-    # Penalize angular velocity on non-target axes
-    rew_non_target_rotation_penalty = -0.1
-    # Penalize object falling / distance from palm
-    rew_object_drop_penalty = -2.0
-    # Penalize large actions (energy)
-    rew_action_penalty = -0.05
-    # Penalize deviation from reference grasp pose
+    # r_vel: object linear velocity penalty (keep object still, only rotating)
+    rew_vel_penalty = -0.5
+    # r_work: joint work/power penalty = |torque * velocity|
+    rew_work_penalty = -0.001
+    # r_torq: joint torque penalty
+    rew_torque_penalty = -0.0001
+    # r_diff: pose deviation from grasp reference
     rew_pose_deviation_penalty = -0.01
-    # Penalize large joint velocities (smoothness)
-    rew_joint_vel_penalty = -0.001
 
     # ----- termination -----
     # Object drop distance threshold (from initial position)

@@ -61,7 +61,12 @@ def main():
         agent_cfg = getattr(agent_cfg_module, agent_class_name)()
 
         wrapped_env = RslRlVecEnvWrapper(env)
-        runner = OnPolicyRunner(wrapped_env, agent_cfg.to_dict(), log_dir="/tmp/play", device="cuda:0")
+        agent_dict = agent_cfg.to_dict()
+        # Strip keys not accepted by RSL-RL >= 5.0
+        for key in ("stochastic", "init_noise_std", "noise_std_type", "state_dependent_std"):
+            for section in ("actor", "critic"):
+                agent_dict.get(section, {}).pop(key, None)
+        runner = OnPolicyRunner(wrapped_env, agent_dict, log_dir="/tmp/play", device="cuda:0")
         runner.load(args_cli.checkpoint)
         policy = runner.get_inference_policy(device="cuda:0")
         print(f"[INFO] Loaded policy from: {args_cli.checkpoint}")
@@ -72,7 +77,7 @@ def main():
     obs, _ = env.reset()
     for step in range(args_cli.num_steps):
         if policy is not None:
-            actions = policy(obs["policy"])
+            actions = policy(obs)
         elif args_cli.zero_action:
             actions = torch.zeros(args_cli.num_envs, env.action_space.shape[-1], device="cuda:0")
         else:
