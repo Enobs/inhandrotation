@@ -39,7 +39,7 @@ class WujiInHandRotationEnvCfg(DirectRLEnvCfg):
 
     # ----- env -----
     decimation = 2  # env step = 2 physics steps => 60 Hz control at 120 Hz physics
-    episode_length_s = 10.0
+    episode_length_s = 20.0
     action_space = 20  # 5 fingers x 4 joints each
     observation_space = _OBS_DIM
     state_space = 0  # 0 = symmetric; set >0 for asymmetric actor-critic later
@@ -119,6 +119,8 @@ class WujiInHandRotationEnvCfg(DirectRLEnvCfg):
                 sleep_threshold=0.005,
                 stabilization_threshold=0.0025,
                 max_depenetration_velocity=0.5,
+                angular_damping=0.5,  # moderate: maintain momentum between finger pushes
+                linear_damping=0.1,
             ),
             mass_props=sim_utils.MassPropertiesCfg(density=100.0),
         ),
@@ -133,7 +135,7 @@ class WujiInHandRotationEnvCfg(DirectRLEnvCfg):
 
     # ----- action parameters -----
     # Action = delta joint position in [-1, 1], scaled by action_scale
-    action_scale = 0.05  # radians per action unit per step
+    action_scale = 0.15  # radians per action unit per step (larger for finger gaiting)
     act_moving_average = 1  # EMA smoothing on targets (1.0 = no smoothing)
 
     # ----- observation parameters -----
@@ -158,7 +160,7 @@ class WujiInHandRotationEnvCfg(DirectRLEnvCfg):
     # r_torq: joint torque penalty
     rew_torque_penalty = -0.0001
     # r_diff: pose deviation from grasp reference
-    rew_pose_deviation_penalty = -0.01
+    rew_pose_deviation_penalty = -0.002
 
     # ----- termination -----
     # Object drop distance threshold (from initial position)

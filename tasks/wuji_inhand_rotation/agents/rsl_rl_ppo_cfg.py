@@ -12,8 +12,8 @@ from isaaclab_rl.rsl_rl import (
 @configclass
 class WujiInHandRotationPPORunnerCfg(RslRlOnPolicyRunnerCfg):
 
-    num_steps_per_env = 16
-    max_iterations = 10000
+    num_steps_per_env = 24
+    max_iterations = 100000
     save_interval = 1000
     experiment_name = "wuji_inhand_rotation"
     run_name = ""

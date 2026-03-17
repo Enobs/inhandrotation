@@ -73,20 +73,59 @@ def main():
     else:
         print("[INFO] No checkpoint provided. Using random actions.")
 
-    # Rollout
-    obs, _ = env.reset()
-    for step in range(args_cli.num_steps):
-        if policy is not None:
+    # Rollout — use wrapped_env when running a trained policy
+    if policy is not None:
+        obs = wrapped_env.get_observations()
+        for step in range(args_cli.num_steps):
             actions = policy(obs)
-        elif args_cli.zero_action:
-            actions = torch.zeros(args_cli.num_envs, env.action_space.shape[-1], device="cuda:0")
-        else:
-            actions = 2.0 * torch.rand(args_cli.num_envs, env.action_space.shape[-1], device="cuda:0") - 1.0
-        obs, rewards, terminated, truncated, infos = env.step(actions)
+            obs, rewards, dones, infos = wrapped_env.step(actions)
 
+            # Access underlying env for debug info
+            base_env = env.unwrapped
+            angvel = base_env.object_angvel[0].cpu()
+            obj_pos = base_env.object_pos_local[0].cpu()
+            action_norm = actions[0].norm().item()
 
-        if step % 100 == 0:
-            print(f"Step {step}: mean_reward={rewards.mean().item():.4f}")
+            # Track quaternion to verify if ball actually rotates
+            obj_quat = base_env.object_rot[0].cpu()
+
+            # Per-finger action magnitudes (which fingers are the policy moving?)
+            finger_action_norms = []
+            act = actions[0].cpu()
+            for fi in range(5):
+                finger_act = act[fi * 4 : (fi + 1) * 4]
+                finger_action_norms.append(finger_act.norm().item())
+
+            # Per-finger joint positions (4 joints each)
+            finger_joint_str = ""
+            hand_pos = base_env.hand_dof_pos[0].cpu()
+            for fi in range(5):
+                joint_vals = [hand_pos[base_env.actuated_dof_indices[fi * 4 + j]].item() for j in range(4)]
+                finger_joint_str += f"  F{fi+1}:[{joint_vals[0]:.2f},{joint_vals[1]:.2f},{joint_vals[2]:.2f},{joint_vals[3]:.2f}]"
+
+            if step % 50 == 0:
+                finger_str = "  ".join([f"F{i+1}:{f:.2f}" for i, f in enumerate(finger_action_norms)])
+                print(
+                    f"Step {step:4d}: rew={rewards[0].item():7.3f}  "
+                    f"angvel_z={angvel[2].item():6.3f}  "
+                    f"|angvel|={angvel.norm().item():6.3f}  "
+                    f"obj_z={obj_pos[2].item():.4f}  "
+                    f"|action|={action_norm:.3f}  "
+                    f"done={dones[0].item()}"
+                )
+                print(f"         actions: {finger_str}")
+                print(f"         joints:{finger_joint_str}")
+                print(f"         quat=[{obj_quat[0].item():.4f},{obj_quat[1].item():.4f},{obj_quat[2].item():.4f},{obj_quat[3].item():.4f}]")
+    else:
+        obs, _ = env.reset()
+        for step in range(args_cli.num_steps):
+            if args_cli.zero_action:
+                actions = torch.zeros(args_cli.num_envs, env.action_space.shape[-1], device="cuda:0")
+            else:
+                actions = 2.0 * torch.rand(args_cli.num_envs, env.action_space.shape[-1], device="cuda:0") - 1.0
+            obs, rewards, terminated, truncated, infos = env.step(actions)
+            if step % 100 == 0:
+                print(f"Step {step}: mean_reward={rewards.mean().item():.4f}")
 
     env.close()
 

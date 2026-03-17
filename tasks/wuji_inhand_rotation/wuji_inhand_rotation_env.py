@@ -106,6 +106,11 @@ class WujiInHandRotationEnv(DirectRLEnv):
         axis = torch.tensor(self.cfg.target_rotation_axis, dtype=torch.float32, device=self.device)
         self.target_axis = (axis / axis.norm()).unsqueeze(0).expand(self.num_envs, -1)  # (N, 3)
 
+        # Previous quaternion buffer for computing real angular velocity from pose changes
+        # (PhysX root_ang_vel_w is unreliable for over-constrained contacts)
+        self.prev_object_quat = torch.zeros((self.num_envs, 4), device=self.device)
+        self.prev_object_quat[:, 0] = 1.0  # identity quaternion (w, x, y, z)
+
     # ------------------------------------------------------------------ #
     # Scene setup
     # ------------------------------------------------------------------ #
@@ -130,6 +135,9 @@ class WujiInHandRotationEnv(DirectRLEnv):
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         self.prev_actions[:] = self.actions
         self.actions = actions.clone().clamp(-1.0, 1.0)
+        # Snapshot current object quaternion BEFORE physics step advances it
+        # (used later to compute real angular velocity from quaternion change)
+        self.prev_object_quat[:] = self.object.data.root_quat_w
 
     def _apply_action(self) -> None:
         # Ramp from open init pose to tight grasp pose over warmup period
@@ -314,6 +322,9 @@ class WujiInHandRotationEnv(DirectRLEnv):
         self.actions[env_ids] = 0.0
         self.prev_actions[env_ids] = 0.0
 
+        # ---- Reset previous quaternion buffer ----
+        self.prev_object_quat[env_ids] = object_default_state[:, 3:7]
+
         # Debug: print init state on first reset for env 0
         if 0 in env_ids and not getattr(self, "_init_debug_printed", False):
             self._init_debug_printed = True
@@ -343,12 +354,67 @@ class WujiInHandRotationEnv(DirectRLEnv):
         self.object_pos_local = self.object.data.root_pos_w - self.scene.env_origins
         self.object_rot = self.object.data.root_quat_w
         self.object_linvel = self.object.data.root_lin_vel_w
-        self.object_angvel = self.object.data.root_ang_vel_w
+
+        # Compute REAL angular velocity from quaternion change (not PhysX solver artifact)
+        # prev_object_quat is saved in _pre_physics_step (before physics advances)
+        dt_env = self.cfg.sim.dt * self.cfg.decimation
+        self.object_angvel = _quat_diff_to_angvel(
+            self.prev_object_quat, self.object_rot, dt_env
+        )
 
 
 # ====================================================================== #
 # JIT-compiled helper functions
 # ====================================================================== #
+
+
+@torch.jit.script
+def _quat_diff_to_angvel(q_prev: torch.Tensor, q_curr: torch.Tensor, dt: float) -> torch.Tensor:
+    """Compute angular velocity from consecutive quaternions.
+
+    Args:
+        q_prev: Previous quaternion (N, 4) in (w, x, y, z) format.
+        q_curr: Current quaternion (N, 4) in (w, x, y, z) format.
+        dt: Time step between the two quaternions.
+
+    Returns:
+        Angular velocity (N, 3) in world frame.
+    """
+    # Compute relative rotation: q_rel = q_curr * q_prev_inv
+    # For unit quaternions, q_inv = q_conjugate = (w, -x, -y, -z)
+    q_prev_inv = q_prev.clone()
+    q_prev_inv[:, 1:] = -q_prev_inv[:, 1:]
+
+    # Quaternion multiplication: q_rel = q_curr * q_prev_inv
+    w1, x1, y1, z1 = q_curr[:, 0], q_curr[:, 1], q_curr[:, 2], q_curr[:, 3]
+    w2, x2, y2, z2 = q_prev_inv[:, 0], q_prev_inv[:, 1], q_prev_inv[:, 2], q_prev_inv[:, 3]
+
+    q_rel_w = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
+    q_rel_x = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2
+    q_rel_y = w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2
+    q_rel_z = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
+
+    # Ensure shortest path (q and -q represent the same rotation)
+    sign = torch.sign(q_rel_w).unsqueeze(-1)
+    sign = torch.where(sign == 0, torch.ones_like(sign), sign)
+    q_rel_w = q_rel_w * sign.squeeze(-1)
+    q_rel_x = q_rel_x * sign.squeeze(-1)
+    q_rel_y = q_rel_y * sign.squeeze(-1)
+    q_rel_z = q_rel_z * sign.squeeze(-1)
+
+    # Convert relative quaternion to axis-angle
+    # angle = 2 * acos(w), axis = (x, y, z) / sin(angle/2)
+    # For small angles, angular_velocity ≈ 2 * (x, y, z) / dt
+    axis_vec = torch.stack([q_rel_x, q_rel_y, q_rel_z], dim=-1)  # (N, 3)
+    sin_half = torch.norm(axis_vec, dim=-1, keepdim=True).clamp(min=1e-8)  # (N, 1)
+    half_angle = torch.atan2(sin_half, q_rel_w.unsqueeze(-1))  # (N, 1)
+    angle = 2.0 * half_angle  # (N, 1)
+
+    # Angular velocity = angle * axis_unit / dt
+    axis_unit = axis_vec / sin_half
+    angvel = (angle / (dt + 1e-8)) * axis_unit  # (N, 3)
+
+    return angvel
 
 
 @torch.jit.script
