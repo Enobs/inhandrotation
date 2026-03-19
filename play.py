@@ -103,8 +103,14 @@ def main():
                 joint_vals = [hand_pos[base_env.actuated_dof_indices[fi * 4 + j]].item() for j in range(4)]
                 finger_joint_str += f"  F{fi+1}:[{joint_vals[0]:.2f},{joint_vals[1]:.2f},{joint_vals[2]:.2f},{joint_vals[3]:.2f}]"
 
+            # Fingertip-to-ball distances (contact check)
+            fingertip_pos = base_env.hand.data.body_pos_w[0, base_env.finger_bodies, :].cpu()  # (5, 3)
+            ball_pos_w = base_env.object.data.root_pos_w[0].cpu()  # (3,)
+            tip_dists = (fingertip_pos - ball_pos_w).norm(dim=-1)  # (5,)
+
             if step % 50 == 0:
                 finger_str = "  ".join([f"F{i+1}:{f:.2f}" for i, f in enumerate(finger_action_norms)])
+                dist_str = "  ".join([f"F{i+1}:{d.item():.3f}m" for i, d in enumerate(tip_dists)])
                 print(
                     f"Step {step:4d}: rew={rewards[0].item():7.3f}  "
                     f"angvel_z={angvel[2].item():6.3f}  "
@@ -115,6 +121,7 @@ def main():
                 )
                 print(f"         actions: {finger_str}")
                 print(f"         joints:{finger_joint_str}")
+                print(f"         tip_dist: {dist_str}")
                 print(f"         quat=[{obj_quat[0].item():.4f},{obj_quat[1].item():.4f},{obj_quat[2].item():.4f},{obj_quat[3].item():.4f}]")
     else:
         obs, _ = env.reset()

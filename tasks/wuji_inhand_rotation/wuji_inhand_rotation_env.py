@@ -61,6 +61,7 @@ class WujiInHandRotationEnv(DirectRLEnv):
         self.prev_targets = torch.zeros((self.num_envs, self.num_hand_dofs), device=self.device)
         self.actions = torch.zeros((self.num_envs, self.num_actuated), device=self.device)
         self.prev_actions = torch.zeros((self.num_envs, self.num_actuated), device=self.device)
+        self.raw_actions = torch.zeros((self.num_envs, self.num_actuated), device=self.device)
 
         # Reference grasp pose: two separate poses
         # - grasp_base_pos = init_state (open, no penetration)
@@ -146,8 +147,14 @@ class WujiInHandRotationEnv(DirectRLEnv):
         ).unsqueeze(-1)  # (N, 1)
         current_grasp_ref = self.grasp_base_pos + (self.grasp_ref_pos - self.grasp_base_pos) * warmup_frac
 
-        # Absolute position control: grasp_ref + action * scale
-        desired = current_grasp_ref + self.actions * self.cfg.action_scale
+        # Asymmetric full-range: action=0 → grasp_ref, action=+1 → upper_limit, action=-1 → lower_limit
+        lower = self.hand_dof_lower_limits[:, self.actuated_dof_indices]
+        upper = self.hand_dof_upper_limits[:, self.actuated_dof_indices]
+        pos_action = torch.relu(self.actions)   # [0,1] portion — moves toward upper limit
+        neg_action = torch.relu(-self.actions)  # [0,1] portion — moves toward lower limit
+        desired = (current_grasp_ref
+                   + pos_action * (upper - current_grasp_ref)
+                   - neg_action * (current_grasp_ref - lower))
 
         # Apply EMA smoothing
         self.cur_targets[:, self.actuated_dof_indices] = (
@@ -443,7 +450,7 @@ def _compute_rewards(
 
     # 1. r_rot: rotation reward — angular velocity projected onto target axis
     angvel_on_axis = torch.sum(object_angvel * target_axis, dim=-1)  # (N,)
-    rotation_reward = rew_rotation_scale * torch.clamp(angvel_on_axis / (target_angular_velocity + 1e-6), min=-1.0, max=2.0)
+    rotation_reward = rew_rotation_scale * torch.clamp(angvel_on_axis / (target_angular_velocity + 1e-6), min=0.0, max=2.0)
 
     # 2. r_vel: object linear velocity penalty (object should stay still, only rotate)
     vel_penalty = rew_vel_penalty * torch.sum(object_linvel ** 2, dim=-1)

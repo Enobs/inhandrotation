@@ -134,8 +134,8 @@ class WujiInHandRotationEnvCfg(DirectRLEnvCfg):
     )
 
     # ----- action parameters -----
-    # Action = delta joint position in [-1, 1], scaled by action_scale
-    action_scale = 0.15  # radians per action unit per step (larger for finger gaiting)
+    # Action in [-1, 1] maps asymmetrically to full URDF joint range:
+    #   action=0 → grasp_ref, action=+1 → upper_limit, action=-1 → lower_limit
     act_moving_average = 1  # EMA smoothing on targets (1.0 = no smoothing)
 
     # ----- observation parameters -----
@@ -143,7 +143,7 @@ class WujiInHandRotationEnvCfg(DirectRLEnvCfg):
 
     # ----- target rotation -----
     # Fixed rotation axis in world frame (z-axis = palm normal, fingers direction)
-    target_rotation_axis = [0.0, 0.0, 1.0]
+    target_rotation_axis = [0.0, 0.0, -1.0]
     target_angular_velocity = 1.0  # desired rad/s around target axis
 
     # ----- reset parameters -----
