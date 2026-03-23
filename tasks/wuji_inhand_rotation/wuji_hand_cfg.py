@@ -49,7 +49,7 @@ _SPAWN_CFG = sim_utils.UrdfFileCfg(
     link_density=1,
     collider_type="convex_hull",
     merge_fixed_joints=False,  # Keep tip links as separate bodies
-    self_collision=False,  # Disable self-collision to test stability
+    self_collision=True,  # Enable finger-to-finger collision detection
     activate_contact_sensors=True,
     joint_drive=UrdfConverterCfg.JointDriveCfg(
         drive_type="force",
@@ -68,7 +68,7 @@ _SPAWN_CFG = sim_utils.UrdfFileCfg(
         max_depenetration_velocity=1.0,
     ),
     articulation_props=sim_utils.ArticulationRootPropertiesCfg(
-        enabled_self_collisions=False,
+        enabled_self_collisions=True,
         solver_position_iteration_count=20,
         solver_velocity_iteration_count=10,
     ),
@@ -159,7 +159,7 @@ WUJI_GRASP_TARGET_JOINT_POS = {
     f"{_SIDE}_finger1_joint2": -0.0554,
     f"{_SIDE}_finger1_joint3": 0.90,
     f"{_SIDE}_finger1_joint4": 0.20,
-    f"{_SIDE}_finger2_joint1": 1.0058259,
+    f"{_SIDE}_finger2_joint1": 1.2058259,
     f"{_SIDE}_finger2_joint2": 0.1867502,
     f"{_SIDE}_finger2_joint3": 0.25,
     f"{_SIDE}_finger2_joint4": 0.33,

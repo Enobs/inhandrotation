@@ -24,6 +24,7 @@ parser.add_argument("--num_envs", type=int, default=16)
 parser.add_argument("--num_steps", type=int, default=1000)
 parser.add_argument("--checkpoint", type=str, default=None, help="Path to trained policy checkpoint")
 parser.add_argument("--zero_action", action="store_true", default=False, help="Send zero actions (static pose test)")
+parser.add_argument("--object_mass", type=float, default=None, help="Override object mass in kg (e.g. 0.2 for 200g)")
 
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
@@ -46,6 +47,10 @@ def main():
     env_cfg = getattr(env_cfg_module, class_name)()
 
     env_cfg.scene.num_envs = args_cli.num_envs
+
+    # Override object mass if specified (for testing grasp at specific mass)
+    if args_cli.object_mass is not None:
+        env_cfg.object_mass_range = (args_cli.object_mass, args_cli.object_mass)  # fixed mass
 
     env = gym.make(args_cli.task, cfg=env_cfg)
 
@@ -74,10 +79,19 @@ def main():
         print("[INFO] No checkpoint provided. Using random actions.")
 
     # Rollout — use wrapped_env when running a trained policy
-    if policy is not None:
-        obs = wrapped_env.get_observations()
+    if policy is not None or args_cli.zero_action:
+        if policy is not None:
+            obs = wrapped_env.get_observations()
+        else:
+            # No checkpoint but --zero_action: still use wrapped env for consistent logging
+            from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
+            wrapped_env = RslRlVecEnvWrapper(env)
+            obs = wrapped_env.get_observations()
         for step in range(args_cli.num_steps):
-            actions = policy(obs)
+            if args_cli.zero_action:
+                actions = torch.zeros(args_cli.num_envs, env.action_space.shape[-1], device="cuda:0")
+            else:
+                actions = policy(obs)
             obs, rewards, dones, infos = wrapped_env.step(actions)
 
             # Access underlying env for debug info

@@ -15,7 +15,7 @@ import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation, RigidObject
 from isaaclab.envs import DirectRLEnv
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
-from isaaclab.utils.math import sample_uniform, saturate
+from isaaclab.utils.math import sample_uniform, saturate, quat_mul, quat_apply, quat_from_angle_axis
 
 from .wuji_hand_cfg import WUJI_GRASP_TARGET_JOINT_POS
 from .wuji_inhand_rotation_env_cfg import WujiInHandRotationEnvCfg
@@ -103,9 +103,32 @@ class WujiInHandRotationEnv(DirectRLEnv):
         self.kp_vec = self.kp_vec.unsqueeze(0)
         self.kd_vec = self.kd_vec.unsqueeze(0)
 
-        # Target rotation axis (normalized, in world frame since hand is fixed)
-        axis = torch.tensor(self.cfg.target_rotation_axis, dtype=torch.float32, device=self.device)
-        self.target_axis = (axis / axis.norm()).unsqueeze(0).expand(self.num_envs, -1)  # (N, 3)
+        # Base hand orientation and position (from config, before randomization)
+        self.base_hand_quat = torch.tensor(
+            self.cfg.robot_cfg.init_state.rot, dtype=torch.float32, device=self.device
+        )  # (4,) in (w, x, y, z)
+        self.base_hand_pos = torch.tensor(
+            self.cfg.robot_cfg.init_state.pos, dtype=torch.float32, device=self.device
+        )  # (3,)
+
+        # Ball position in hand LOCAL frame (constant)
+        # Computed from original palm-up config: hand=(0,0,0.5) rot=(0.707,0,-0.707,0), ball=(-0.095,0,0.56)
+        # local X = 0.06m (above palm), local Z = 0.095m (along fingers)
+        self.ball_local_offset = torch.tensor([0.06, 0.0, 0.095], dtype=torch.float32, device=self.device)
+
+        # Per-env hand quaternion (updated at reset with randomization)
+        self.hand_quat = self.base_hand_quat.unsqueeze(0).expand(self.num_envs, -1).clone()  # (N, 4)
+
+        # Target rotation axis in hand LOCAL frame: palm normal is local X, rotation around -X
+        self.target_axis_local = torch.tensor(
+            self.cfg.target_rotation_axis_local, dtype=torch.float32, device=self.device
+        )
+        self.target_axis_local = self.target_axis_local / self.target_axis_local.norm()
+
+        # Per-env target axis in world frame (recomputed at reset from hand orientation)
+        self.target_axis = quat_apply(
+            self.hand_quat, self.target_axis_local.unsqueeze(0).expand(self.num_envs, -1)
+        )  # (N, 3)
 
         # Previous quaternion buffer for computing real angular velocity from pose changes
         # (PhysX root_ang_vel_w is unreliable for over-constrained contacts)
@@ -231,12 +254,15 @@ class WujiInHandRotationEnv(DirectRLEnv):
             grasp_ref_pos=self.grasp_ref_pos,
             hand_dof_vel_actuated=vel,
             estimated_torque=estimated_torque,
+            fingertip_ball_dist=self.fingertip_ball_dist,
             # scales (IMCopilot: r_rot, r_vel, r_work, r_torq, r_diff)
             rew_rotation_scale=self.cfg.rew_rotation_scale,
             rew_vel_penalty=self.cfg.rew_vel_penalty,
             rew_work_penalty=self.cfg.rew_work_penalty,
             rew_torque_penalty=self.cfg.rew_torque_penalty,
             rew_pose_deviation_penalty=self.cfg.rew_pose_deviation_penalty,
+            rew_finger_proximity=self.cfg.rew_finger_proximity,
+            rew_joint_smoothness=self.cfg.rew_joint_smoothness,
         )
         # Log reward components to extras for tensorboard
         self.extras["log"] = {
@@ -246,6 +272,8 @@ class WujiInHandRotationEnv(DirectRLEnv):
             "rew_torque_penalty": components[3].mean(),
             "rew_pose_deviation": components[4].mean(),
             "angvel_on_axis": components[5].mean(),
+            "rew_finger_proximity": components[6].mean(),
+            "rew_joint_smoothness": components[7].mean(),
         }
         return total
 
@@ -310,20 +338,69 @@ class WujiInHandRotationEnv(DirectRLEnv):
         self.prev_targets[env_ids] = grasp_targets
         self.cur_targets[env_ids] = grasp_targets
 
-        # ---- Reset object to palm-center + noise ----
-        object_default_state = self.object.data.default_root_state[env_ids].clone()
+        # ---- Randomize hand orientation ----
+        if self.cfg.reset_hand_rot_noise > 0.0:
+            # Random rotation: sample random axis + random angle within range
+            rand_angle = sample_uniform(
+                -self.cfg.reset_hand_rot_noise,
+                self.cfg.reset_hand_rot_noise,
+                (num_resets, 1),
+                device=self.device,
+            )
+            rand_axis = torch.randn(num_resets, 3, device=self.device)
+            rand_axis = rand_axis / rand_axis.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+            # Convert to quaternion perturbation
+            perturb_quat = quat_from_angle_axis(rand_angle.squeeze(-1), rand_axis)  # (N, 4)
+            # Compose: new_quat = perturb * base
+            new_hand_quat = quat_mul(perturb_quat, self.base_hand_quat.unsqueeze(0).expand(num_resets, -1))
+        else:
+            new_hand_quat = self.base_hand_quat.unsqueeze(0).expand(num_resets, -1)
+
+        # Store per-env hand quaternion
+        self.hand_quat[env_ids] = new_hand_quat
+
+        # Write new hand root pose (position stays the same, orientation randomized)
+        hand_root_pose = torch.zeros(num_resets, 7, device=self.device)
+        hand_root_pose[:, :3] = self.base_hand_pos + self.scene.env_origins[env_ids]
+        hand_root_pose[:, 3:7] = new_hand_quat
+        self.hand.write_root_pose_to_sim(hand_root_pose, env_ids)
+
+        # Update target rotation axis in world frame for these envs
+        self.target_axis[env_ids] = quat_apply(
+            new_hand_quat, self.target_axis_local.unsqueeze(0).expand(num_resets, -1)
+        )
+
+        # ---- Reset object to palm-center + noise (position relative to hand orientation) ----
+        # Ball position = hand_pos + rotate(hand_quat, ball_local_offset) + noise
+        ball_world_offset = quat_apply(new_hand_quat, self.ball_local_offset.unsqueeze(0).expand(num_resets, -1))
+        ball_world_pos = self.base_hand_pos + ball_world_offset
+
         pos_noise = sample_uniform(
             -self.cfg.reset_object_pos_noise,
             self.cfg.reset_object_pos_noise,
             (num_resets, 3),
             device=self.device,
         )
-        object_default_state[:, 0:3] += pos_noise + self.scene.env_origins[env_ids]
+
+        object_default_state = self.object.data.default_root_state[env_ids].clone()
+        object_default_state[:, 0:3] = ball_world_pos + pos_noise + self.scene.env_origins[env_ids]
         object_default_state[:, 3:7] = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device)
         object_default_state[:, 7:] = 0.0  # zero velocity
 
         self.object.write_root_pose_to_sim(object_default_state[:, :7], env_ids)
         self.object.write_root_velocity_to_sim(object_default_state[:, 7:], env_ids)
+
+        # ---- Update object init position for drop detection (varies per-env with hand rotation) ----
+        self.object_init_pos_local[env_ids] = ball_world_pos + pos_noise
+
+        # ---- DR: randomize object mass ----
+        if self.cfg.object_mass_range is not None:
+            lo, hi = self.cfg.object_mass_range
+            # get_masses returns (num_envs, num_bodies) — modify only reset envs
+            masses = self.object.root_physx_view.get_masses()
+            rand_mass = sample_uniform(lo, hi, (num_resets, 1), device=masses.device)
+            masses[env_ids] = rand_mass
+            self.object.root_physx_view.set_masses(masses, torch.tensor(env_ids, device="cpu") if not isinstance(env_ids, torch.Tensor) else env_ids.cpu())
 
         # ---- Reset action buffers ----
         self.actions[env_ids] = 0.0
@@ -338,6 +415,7 @@ class WujiInHandRotationEnv(DirectRLEnv):
             idx = 0
             print("\n" + "=" * 70)
             print("[DEBUG] Init state for env 0:")
+            print(f"  Hand quat (w,x,y,z):            {new_hand_quat[idx].cpu().tolist()}")
             print(f"  Hand init joint pos (actuated): {dof_pos[idx, self.actuated_dof_indices].cpu().tolist()}")
             print(f"  Grasp ref pos (PD target):      {self.grasp_ref_pos[idx].cpu().tolist()}")
             print(f"  Squeeze offset:                 {(self.grasp_ref_pos[idx] - dof_pos[idx, self.actuated_dof_indices]).mean().item():.4f} rad")
@@ -347,6 +425,7 @@ class WujiInHandRotationEnv(DirectRLEnv):
             print(f"  Object world pos: {obj_pos}")
             print(f"  Object local pos: {local_pos}")
             print(f"  Object init ref:  {self.object_init_pos_local[idx].cpu().tolist()}")
+            print(f"  Target axis (world): {self.target_axis[idx].cpu().tolist()}")
             print("=" * 70 + "\n")
 
     # ------------------------------------------------------------------ #
@@ -368,6 +447,11 @@ class WujiInHandRotationEnv(DirectRLEnv):
         self.object_angvel = _quat_diff_to_angvel(
             self.prev_object_quat, self.object_rot, dt_env
         )
+
+        # Fingertip-to-ball distances (for finger proximity reward)
+        fingertip_pos = self.hand.data.body_pos_w[:, self.finger_bodies, :]  # (N, 5, 3)
+        ball_pos = self.object.data.root_pos_w  # (N, 3)
+        self.fingertip_ball_dist = (fingertip_pos - ball_pos.unsqueeze(1)).norm(dim=-1)  # (N, 5)
 
 
 # ====================================================================== #
@@ -440,13 +524,16 @@ def _compute_rewards(
     grasp_ref_pos: torch.Tensor,
     hand_dof_vel_actuated: torch.Tensor,
     estimated_torque: torch.Tensor,
+    fingertip_ball_dist: torch.Tensor,
     rew_rotation_scale: float,
     rew_vel_penalty: float,
     rew_work_penalty: float,
     rew_torque_penalty: float,
     rew_pose_deviation_penalty: float,
+    rew_finger_proximity: float,
+    rew_joint_smoothness: float,
 ) -> tuple[torch.Tensor, list[torch.Tensor]]:
-    """Compute reward for in-hand rotation (IMCopilot paper: r_rot + r_vel + r_work + r_torq + r_diff)."""
+    """Compute reward for in-hand rotation (IMCopilot paper: r_rot + r_vel + r_work + r_torq + r_diff + r_finger + r_smooth)."""
 
     # 1. r_rot: rotation reward — angular velocity projected onto target axis
     angvel_on_axis = torch.sum(object_angvel * target_axis, dim=-1)  # (N,)
@@ -467,17 +554,34 @@ def _compute_rewards(
         (hand_dof_pos_actuated - grasp_ref_pos) ** 2, dim=-1
     )
 
+    # 6. r_finger: fingertip proximity reward — encourage all fingers to stay near the ball
+    # fingertip_ball_dist: (N, 5) — distance from each fingertip to ball center
+    # Penalize mean distance across all 5 fingers (negative scale → closer = better)
+    finger_proximity = rew_finger_proximity * torch.mean(fingertip_ball_dist, dim=-1)
+
+    # 7. r_smooth: per-finger joint smoothness — penalize zig-zag joint angles
+    # For each finger (4 joints), penalize large differences between adjacent joints
+    # Natural curl: [0.3, 0.6, 0.9, 1.2] → small diffs. Unnatural: [0.0, 1.5, 0.0, 1.5] → large diffs
+    smooth_penalty_sum = torch.zeros_like(rotation_reward)
+    for fi in range(5):
+        for ji in range(3):  # adjacent pairs: J1-J2, J2-J3, J3-J4
+            diff = hand_dof_pos_actuated[:, fi * 4 + ji + 1] - hand_dof_pos_actuated[:, fi * 4 + ji]
+            smooth_penalty_sum = smooth_penalty_sum + diff * diff
+    joint_smoothness = rew_joint_smoothness * smooth_penalty_sum
+
     total_reward = (
         rotation_reward
         + vel_penalty
         + work_penalty
         + torque_penalty
         + pose_deviation
+        + finger_proximity
+        + joint_smoothness
     )
 
     components: list[torch.Tensor] = [
         rotation_reward, vel_penalty, work_penalty, torque_penalty,
-        pose_deviation, angvel_on_axis,
+        pose_deviation, angvel_on_axis, finger_proximity, joint_smoothness,
     ]
 
     return total_reward, components

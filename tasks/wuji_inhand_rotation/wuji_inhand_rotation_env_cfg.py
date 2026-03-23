@@ -49,8 +49,8 @@ class WujiInHandRotationEnvCfg(DirectRLEnvCfg):
         dt=1.0 / 120.0,
         render_interval=2,
         physics_material=RigidBodyMaterialCfg(
-            static_friction=2.0,
-            dynamic_friction=2.0,
+            static_friction=1.5,
+            dynamic_friction=1.5,
             restitution=0.0,
         ),
         physx=PhysxCfg(
@@ -142,13 +142,17 @@ class WujiInHandRotationEnvCfg(DirectRLEnvCfg):
     vel_obs_scale = 0.2  # scale joint/object velocities in obs
 
     # ----- target rotation -----
-    # Fixed rotation axis in world frame (z-axis = palm normal, fingers direction)
-    target_rotation_axis = [0.0, 0.0, -1.0]
+    # Rotation axis in hand LOCAL frame (-X = palm normal inward direction)
+    # This gets transformed to world frame based on hand orientation at reset
+    target_rotation_axis_local = [-1.0, 0.0, 0.0]
     target_angular_velocity = 1.0  # desired rad/s around target axis
 
     # ----- reset parameters -----
-    reset_dof_pos_noise = 0.0  # noise range for finger joints at reset (disabled for debugging)
-    reset_object_pos_noise = 0.0  # noise range for object position at reset (disabled for debugging)
+    reset_dof_pos_noise = 0.05  # noise range for finger joints at reset (~2.9 degrees)
+    reset_object_pos_noise = 0.005  # noise range for object position at reset (5mm)
+    reset_hand_rot_noise = 3.14159  # full rotation range — grasp holds at any orientation
+    # DR: object mass range [min, max] in kg (default ~0.0165 from density=100)
+    object_mass_range = (0.01, 0.2)  # 10g to 200g
 
     # ----- reward scales (IMCopilot paper: r_rot + r_vel + r_work + r_torq + r_diff) -----
     # r_rot: rotation tracking reward (angular velocity along target axis)
@@ -161,6 +165,10 @@ class WujiInHandRotationEnvCfg(DirectRLEnvCfg):
     rew_torque_penalty = -0.0001
     # r_diff: pose deviation from grasp reference
     rew_pose_deviation_penalty = -0.002
+    # r_finger: fingertip proximity — penalize fingers being far from ball (forces finger contact, not palm-only)
+    rew_finger_proximity = -5.0
+    # r_smooth: joint smoothness — penalize zig-zag joint angles within each finger (natural curl)
+    rew_joint_smoothness = -0.5
 
     # ----- termination -----
     # Object drop distance threshold (from initial position)
