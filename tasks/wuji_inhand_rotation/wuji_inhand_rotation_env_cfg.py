@@ -151,8 +151,20 @@ class WujiInHandRotationEnvCfg(DirectRLEnvCfg):
     reset_dof_pos_noise = 0.05  # noise range for finger joints at reset (~2.9 degrees)
     reset_object_pos_noise = 0.005  # noise range for object position at reset (5mm)
     reset_hand_rot_noise = 3.14159  # full rotation range — grasp holds at any orientation
+    # ----- domain randomization (IMCopilot: scale, mass, friction, CoM, gravity, PD gains) -----
     # DR: object mass range [min, max] in kg (default ~0.0165 from density=100)
     object_mass_range = (0.01, 0.2)  # 10g to 200g
+    # DR: object scale range (uniform multiplier on mesh scale)
+    # NOTE: USD-level operation, slow per-prim — disable for now, enable for final training
+    object_scale_range = None  # (0.8, 1.2)
+    # DR: object friction range (static & dynamic friction)
+    object_friction_range = (0.5, 2.0)
+    # DR: object center-of-mass offset range (m, uniform per axis)
+    object_com_offset_range = (-0.01, 0.01)
+    # DR: gravity magnitude range (m/s^2, nominal = 9.81)
+    gravity_range = (9.01, 10.61)  # ±~8% around 9.81
+    # DR: PD gain scale range (multiplier on nominal Kp/Kd)
+    pd_gain_scale_range = (0.7, 1.3)
 
     # ----- reward scales (IMCopilot paper: r_rot + r_vel + r_work + r_torq + r_diff) -----
     # r_rot: rotation tracking reward (angular velocity along target axis)
@@ -165,10 +177,6 @@ class WujiInHandRotationEnvCfg(DirectRLEnvCfg):
     rew_torque_penalty = -0.0001
     # r_diff: pose deviation from grasp reference
     rew_pose_deviation_penalty = -0.002
-    # r_finger: fingertip proximity — penalize fingers being far from ball (forces finger contact, not palm-only)
-    rew_finger_proximity = -5.0
-    # r_smooth: joint smoothness — penalize zig-zag joint angles within each finger (natural curl)
-    rew_joint_smoothness = -0.5
 
     # ----- termination -----
     # Object drop distance threshold (from initial position)

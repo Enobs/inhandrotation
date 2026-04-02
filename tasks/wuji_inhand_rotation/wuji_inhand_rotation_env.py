@@ -103,6 +103,13 @@ class WujiInHandRotationEnv(DirectRLEnv):
         self.kp_vec = self.kp_vec.unsqueeze(0)
         self.kd_vec = self.kd_vec.unsqueeze(0)
 
+        # Store default PD gains for DR (will be scaled per-reset)
+        self.default_kp = self.hand.root_physx_view.get_dof_stiffnesses().clone()  # (N, num_dofs)
+        self.default_kd = self.hand.root_physx_view.get_dof_dampings().clone()     # (N, num_dofs)
+
+        # Store default object COM for DR offset
+        self.default_object_com = self.object.root_physx_view.get_coms().clone()  # (N, 1, 7) or similar
+
         # Base hand orientation and position (from config, before randomization)
         self.base_hand_quat = torch.tensor(
             self.cfg.robot_cfg.init_state.rot, dtype=torch.float32, device=self.device
@@ -254,15 +261,11 @@ class WujiInHandRotationEnv(DirectRLEnv):
             grasp_ref_pos=self.grasp_ref_pos,
             hand_dof_vel_actuated=vel,
             estimated_torque=estimated_torque,
-            fingertip_ball_dist=self.fingertip_ball_dist,
-            # scales (IMCopilot: r_rot, r_vel, r_work, r_torq, r_diff)
             rew_rotation_scale=self.cfg.rew_rotation_scale,
             rew_vel_penalty=self.cfg.rew_vel_penalty,
             rew_work_penalty=self.cfg.rew_work_penalty,
             rew_torque_penalty=self.cfg.rew_torque_penalty,
             rew_pose_deviation_penalty=self.cfg.rew_pose_deviation_penalty,
-            rew_finger_proximity=self.cfg.rew_finger_proximity,
-            rew_joint_smoothness=self.cfg.rew_joint_smoothness,
         )
         # Log reward components to extras for tensorboard
         self.extras["log"] = {
@@ -272,8 +275,6 @@ class WujiInHandRotationEnv(DirectRLEnv):
             "rew_torque_penalty": components[3].mean(),
             "rew_pose_deviation": components[4].mean(),
             "angvel_on_axis": components[5].mean(),
-            "rew_finger_proximity": components[6].mean(),
-            "rew_joint_smoothness": components[7].mean(),
         }
         return total
 
@@ -393,14 +394,83 @@ class WujiInHandRotationEnv(DirectRLEnv):
         # ---- Update object init position for drop detection (varies per-env with hand rotation) ----
         self.object_init_pos_local[env_ids] = ball_world_pos + pos_noise
 
+        # ---- DR: helper for env_ids on CPU ----
+        env_ids_cpu = torch.tensor(env_ids, device="cpu") if not isinstance(env_ids, torch.Tensor) else env_ids.cpu()
+
+        # ---- DR: randomize object scale (USD-level) ----
+        if self.cfg.object_scale_range is not None:
+            import omni.usd
+            lo, hi = self.cfg.object_scale_range
+            stage = omni.usd.get_context().get_stage()
+            for i in range(num_resets):
+                eid = env_ids[i] if isinstance(env_ids, (list, torch.Tensor)) else env_ids
+                scale = sample_uniform(lo, hi, (1,), device=self.device).item()
+                prim_path = f"/World/envs/env_{eid}/object"
+                prim = stage.GetPrimAtPath(prim_path)
+                if prim.IsValid():
+                    from pxr import UsdGeom
+                    xformable = UsdGeom.Xformable(prim)
+                    scale_ops = [op for op in xformable.GetOrderedXformOps() if "scale" in op.GetOpName().lower()]
+                    if scale_ops:
+                        scale_ops[0].Set((scale, scale, scale))
+                    else:
+                        xformable.AddScaleOp().Set((scale, scale, scale))
+
         # ---- DR: randomize object mass ----
         if self.cfg.object_mass_range is not None:
             lo, hi = self.cfg.object_mass_range
-            # get_masses returns (num_envs, num_bodies) — modify only reset envs
             masses = self.object.root_physx_view.get_masses()
             rand_mass = sample_uniform(lo, hi, (num_resets, 1), device=masses.device)
-            masses[env_ids] = rand_mass
-            self.object.root_physx_view.set_masses(masses, torch.tensor(env_ids, device="cpu") if not isinstance(env_ids, torch.Tensor) else env_ids.cpu())
+            masses[env_ids_cpu] = rand_mass
+            self.object.root_physx_view.set_masses(masses, env_ids_cpu)
+
+        # ---- DR: randomize object friction ----
+        if self.cfg.object_friction_range is not None:
+            lo, hi = self.cfg.object_friction_range
+            # material_properties shape: (num_envs, num_shapes, 3) = [static_friction, dynamic_friction, restitution]
+            mat_props = self.object.root_physx_view.get_material_properties()
+            rand_friction = sample_uniform(lo, hi, (num_resets, 1, 1), device=mat_props.device)
+            mat_props[env_ids_cpu, :, 0] = rand_friction.squeeze(-1)  # static friction
+            mat_props[env_ids_cpu, :, 1] = rand_friction.squeeze(-1)  # dynamic friction (same value)
+            self.object.root_physx_view.set_material_properties(mat_props, env_ids_cpu)
+
+        # ---- DR: randomize object center-of-mass offset ----
+        if self.cfg.object_com_offset_range is not None:
+            lo, hi = self.cfg.object_com_offset_range
+            coms = self.default_object_com.clone()
+            # coms may be on CPU (PhysX view); use its device
+            if coms.dim() == 2:
+                com_offset = sample_uniform(lo, hi, (num_resets, 3), device=coms.device)
+                coms[env_ids_cpu, :3] = coms[env_ids_cpu, :3] + com_offset
+            else:
+                com_offset = sample_uniform(lo, hi, (num_resets, 1, 3), device=coms.device)
+                coms[env_ids_cpu, :, :3] = coms[env_ids_cpu, :, :3] + com_offset
+            self.object.root_physx_view.set_coms(coms, env_ids_cpu)
+
+        # ---- DR: randomize gravity ----
+        if self.cfg.gravity_range is not None:
+            import isaaclab.sim as sim_utils_dr
+            lo, hi = self.cfg.gravity_range
+            rand_gz = -sample_uniform(lo, hi, (1,), device=self.device).item()  # negative Z
+            physics_sim_view = sim_utils_dr.SimulationContext.instance().physics_sim_view
+            import carb
+            physics_sim_view.set_gravity(carb.Float3(0.0, 0.0, rand_gz))
+
+        # ---- DR: randomize PD gains (Kp/Kd) ----
+        if self.cfg.pd_gain_scale_range is not None:
+            lo, hi = self.cfg.pd_gain_scale_range
+            # Per-env, per-dof scale factor
+            stiffnesses = self.hand.root_physx_view.get_dof_stiffnesses()
+            dampings = self.hand.root_physx_view.get_dof_dampings()
+            kp_scale = sample_uniform(lo, hi, (num_resets, self.num_hand_dofs), device=stiffnesses.device)
+            kd_scale = sample_uniform(lo, hi, (num_resets, self.num_hand_dofs), device=dampings.device)
+            stiffnesses[env_ids_cpu] = self.default_kp[env_ids_cpu] * kp_scale
+            dampings[env_ids_cpu] = self.default_kd[env_ids_cpu] * kd_scale
+            self.hand.root_physx_view.set_dof_stiffnesses(stiffnesses, env_ids_cpu)
+            self.hand.root_physx_view.set_dof_dampings(dampings, env_ids_cpu)
+            # Also update torque estimation vectors for reward computation
+            self.kp_vec = stiffnesses[:1, self.actuated_dof_indices].to(self.device)
+            self.kd_vec = dampings[:1, self.actuated_dof_indices].to(self.device)
 
         # ---- Reset action buffers ----
         self.actions[env_ids] = 0.0
@@ -448,10 +518,6 @@ class WujiInHandRotationEnv(DirectRLEnv):
             self.prev_object_quat, self.object_rot, dt_env
         )
 
-        # Fingertip-to-ball distances (for finger proximity reward)
-        fingertip_pos = self.hand.data.body_pos_w[:, self.finger_bodies, :]  # (N, 5, 3)
-        ball_pos = self.object.data.root_pos_w  # (N, 3)
-        self.fingertip_ball_dist = (fingertip_pos - ball_pos.unsqueeze(1)).norm(dim=-1)  # (N, 5)
 
 
 # ====================================================================== #
@@ -524,20 +590,19 @@ def _compute_rewards(
     grasp_ref_pos: torch.Tensor,
     hand_dof_vel_actuated: torch.Tensor,
     estimated_torque: torch.Tensor,
-    fingertip_ball_dist: torch.Tensor,
     rew_rotation_scale: float,
     rew_vel_penalty: float,
     rew_work_penalty: float,
     rew_torque_penalty: float,
     rew_pose_deviation_penalty: float,
-    rew_finger_proximity: float,
-    rew_joint_smoothness: float,
 ) -> tuple[torch.Tensor, list[torch.Tensor]]:
-    """Compute reward for in-hand rotation (IMCopilot paper: r_rot + r_vel + r_work + r_torq + r_diff + r_finger + r_smooth)."""
+    """Compute reward for in-hand rotation (IMCopilot paper: r_rot + r_vel + r_work + r_torq + r_diff)."""
 
-    # 1. r_rot: rotation reward — angular velocity projected onto target axis
+    # 1. r_rot: rotation tracking reward — Gaussian around target angular velocity
+    #    angvel projected onto target axis; reward peaks when matching target speed
     angvel_on_axis = torch.sum(object_angvel * target_axis, dim=-1)  # (N,)
-    rotation_reward = rew_rotation_scale * torch.clamp(angvel_on_axis / (target_angular_velocity + 1e-6), min=0.0, max=2.0)
+    vel_error = angvel_on_axis - target_angular_velocity
+    rotation_reward = rew_rotation_scale * torch.exp(-0.5 * vel_error * vel_error)
 
     # 2. r_vel: object linear velocity penalty (object should stay still, only rotate)
     vel_penalty = rew_vel_penalty * torch.sum(object_linvel ** 2, dim=-1)
@@ -554,34 +619,17 @@ def _compute_rewards(
         (hand_dof_pos_actuated - grasp_ref_pos) ** 2, dim=-1
     )
 
-    # 6. r_finger: fingertip proximity reward — encourage all fingers to stay near the ball
-    # fingertip_ball_dist: (N, 5) — distance from each fingertip to ball center
-    # Penalize mean distance across all 5 fingers (negative scale → closer = better)
-    finger_proximity = rew_finger_proximity * torch.mean(fingertip_ball_dist, dim=-1)
-
-    # 7. r_smooth: per-finger joint smoothness — penalize zig-zag joint angles
-    # For each finger (4 joints), penalize large differences between adjacent joints
-    # Natural curl: [0.3, 0.6, 0.9, 1.2] → small diffs. Unnatural: [0.0, 1.5, 0.0, 1.5] → large diffs
-    smooth_penalty_sum = torch.zeros_like(rotation_reward)
-    for fi in range(5):
-        for ji in range(3):  # adjacent pairs: J1-J2, J2-J3, J3-J4
-            diff = hand_dof_pos_actuated[:, fi * 4 + ji + 1] - hand_dof_pos_actuated[:, fi * 4 + ji]
-            smooth_penalty_sum = smooth_penalty_sum + diff * diff
-    joint_smoothness = rew_joint_smoothness * smooth_penalty_sum
-
     total_reward = (
         rotation_reward
         + vel_penalty
         + work_penalty
         + torque_penalty
         + pose_deviation
-        + finger_proximity
-        + joint_smoothness
     )
 
     components: list[torch.Tensor] = [
         rotation_reward, vel_penalty, work_penalty, torque_penalty,
-        pose_deviation, angvel_on_axis, finger_proximity, joint_smoothness,
+        pose_deviation, angvel_on_axis,
     ]
 
     return total_reward, components
