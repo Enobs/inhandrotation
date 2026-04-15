@@ -20,17 +20,27 @@ SPHERE_URDF_PATH = os.path.join(
     "coacd_decomposed_object_one_link.urdf",
 )
 
-# ---- Observation space breakdown ----
+# ---- Actor observation space (proprioception + privileged object state) ----
 # hand joint pos:       20  (5 fingers x 4 joints)
 # hand joint vel:       20
 # previous actions:     20
-# object pos (rel):      3
-# object rot (quat):     4
-# object lin vel:        3
-# object ang vel:        3
+# object pos (rel):      3  (privileged — will be distilled out for student)
+# object rot (quat):     4  (privileged)
+# object lin vel:        3  (privileged)
+# object ang vel:        3  (privileged)
 # target rot axis:       3
 # ---- Total:           76
 _OBS_DIM = 76
+
+# ---- Critic state space (actor obs + DR privileged info) ----
+# actor obs:            76
+# object mass:           1
+# object friction:       1
+# object CoM offset:     3
+# PD gain scale Kp:      1  (mean across joints)
+# PD gain scale Kd:      1  (mean across joints)
+# ---- Total:           83
+_STATE_DIM = 83
 
 
 @configclass
@@ -42,7 +52,10 @@ class WujiInHandRotationEnvCfg(DirectRLEnvCfg):
     episode_length_s = 20.0
     action_space = 20  # 5 fingers x 4 joints each
     observation_space = _OBS_DIM
-    state_space = 0  # 0 = symmetric; set >0 for asymmetric actor-critic later
+    state_space = _STATE_DIM  # asymmetric actor-critic: critic gets privileged DR info
+
+    # ----- observation history -----
+    num_obs_history = 3  # number of proprioception history steps for future student distillation
 
     # ----- simulation -----
     sim: SimulationCfg = SimulationCfg(
@@ -137,6 +150,9 @@ class WujiInHandRotationEnvCfg(DirectRLEnvCfg):
     # Action in [-1, 1] maps asymmetrically to full URDF joint range:
     #   action=0 → grasp_ref, action=+1 → upper_limit, action=-1 → lower_limit
     act_moving_average = 1  # EMA smoothing on targets (1.0 = no smoothing)
+    # Delta action scale (Sharpa-style): each step target += action_scale * action
+    # Sharpa uses 1/24 ≈ 0.0417 with 60 Hz control
+    action_scale = 1.0 / 24.0
 
     # ----- observation parameters -----
     vel_obs_scale = 0.2  # scale joint/object velocities in obs
@@ -162,21 +178,33 @@ class WujiInHandRotationEnvCfg(DirectRLEnvCfg):
     # DR: object center-of-mass offset range (m, uniform per axis)
     object_com_offset_range = (-0.01, 0.01)
     # DR: gravity magnitude range (m/s^2, nominal = 9.81)
-    gravity_range = (9.01, 10.61)  # ±~8% around 9.81
-    # DR: PD gain scale range (multiplier on nominal Kp/Kd)
-    pd_gain_scale_range = (0.7, 1.3)
+    gravity_range = None  # disabled in favor of gravity_curriculum below
+    # DR: PD gain scale range (multiplier on nominal Kp/Kd) — Sharpa: [0.5, 2.0]
+    pd_gain_scale_range = (0.5, 2.0)
+    # Joint observation noise stddev (Sharpa: 0.02 on normalized joint pos)
+    joint_obs_noise = 0.02
 
-    # ----- reward scales (IMCopilot paper: r_rot + r_vel + r_work + r_torq + r_diff) -----
-    # r_rot: rotation tracking reward (angular velocity along target axis)
-    rew_rotation_scale = 5.0
-    # r_vel: object linear velocity penalty (keep object still, only rotating)
-    rew_vel_penalty = -0.5
-    # r_work: joint work/power penalty = |torque * velocity|
-    rew_work_penalty = -0.001
-    # r_torq: joint torque penalty
-    rew_torque_penalty = -0.0001
-    # r_diff: pose deviation from grasp reference
-    rew_pose_deviation_penalty = -0.002
+    # ----- reward scales (Sharpa-style: sharpa_wave_env_cfg.py:269-276) -----
+    angvel_clip_min = -0.5
+    angvel_clip_max = 0.5
+    rew_rotation_scale = 2.5         # r_rot: clamped angvel on target axis
+    rew_linvel_penalty_scale = -0.3  # r_vel: L1 |Δpos|/dt penalty
+    rew_pos_diff_scale = -0.4        # r_diff: pose deviation from default
+    rew_torque_scale = -0.00001      # r_torq: sum(τ²) — our Kp>>Sharpa's, scale down
+    rew_work_scale = -0.0000001      # r_work: (Σ τ·v)² — target ~-0.15 per step
+    rew_object_pos_scale = 0.003     # r_pos: 1/(|pos - init_pos|+0.001) bonus
+
+    # ----- random external forces on object (sharpa_wave_env.py:189-196) -----
+    force_scale = 2.0                # external force magnitude scale
+    random_force_prob_scalar = 0.25  # probability of applying force per step per env
+    force_decay = 0.9                # exponential decay factor
+    force_decay_interval = 0.08      # decay time interval (s)
+
+    # ----- gravity curriculum (sharpa_wave_env.py:259-265) -----
+    gravity_curriculum = True        # start near-zero g, increase as policy learns
+    gravity_curriculum_init = 0.05   # m/s^2, initial gravity magnitude (Z down)
+    gravity_curriculum_step = 0.1    # m/s^2 increment per success threshold (faster)
+    gravity_curriculum_max = 9.81    # final gravity
 
     # ----- termination -----
     # Object drop distance threshold (from initial position)

@@ -12,7 +12,7 @@ from isaaclab_rl.rsl_rl import (
 @configclass
 class WujiInHandRotationPPORunnerCfg(RslRlOnPolicyRunnerCfg):
 
-    num_steps_per_env = 24
+    num_steps_per_env = 8  # Sharpa-style short horizon for fast feedback
     max_iterations = 100000
     save_interval = 1000
     experiment_name = "wuji_inhand_rotation"
@@ -20,12 +20,12 @@ class WujiInHandRotationPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     logger = "tensorboard"
     empirical_normalization = False
 
-    # -- observation groups: map env obs groups to algo obs sets
-    # "policy" group goes to both actor and critic for now (symmetric)
-    # later can add "privileged" group for asymmetric actor-critic
+    # -- observation groups: asymmetric actor-critic
+    # actor sees: policy obs (proprioception + object state) = 76
+    # critic sees: critic state (policy obs + DR privileged info) = 83
     obs_groups = {
         "actor": ["policy"],
-        "critic": ["policy"],
+        "critic": ["critic"],
     }
 
     # -- actor network
@@ -47,13 +47,13 @@ class WujiInHandRotationPPORunnerCfg(RslRlOnPolicyRunnerCfg):
 
     # -- PPO algorithm
     algorithm = RslRlPpoAlgorithmCfg(
-        value_loss_coef=1.0,
+        value_loss_coef=4.0,  # Sharpa: critic_coef=4
         use_clipped_value_loss=True,
         clip_param=0.2,
-        entropy_coef=0.001,
+        entropy_coef=0.0005,  # lower to prevent std growth
         num_learning_epochs=5,
         num_mini_batches=4,
-        learning_rate=3.0e-4,
+        learning_rate=3.0e-4,  # back to stable value; Sharpa's 5e-3 is for their custom PPO
         schedule="adaptive",
         gamma=0.99,
         lam=0.95,

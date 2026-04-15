@@ -110,6 +110,20 @@ class WujiInHandRotationEnv(DirectRLEnv):
         # Store default object COM for DR offset
         self.default_object_com = self.object.root_physx_view.get_coms().clone()  # (N, 1, 7) or similar
 
+        # ---- Privileged info buffers (for asymmetric critic) ----
+        self.current_object_mass = torch.zeros(self.num_envs, 1, device=self.device)
+        self.current_object_friction = torch.zeros(self.num_envs, 1, device=self.device)
+        self.current_com_offset = torch.zeros(self.num_envs, 3, device=self.device)
+        self.current_kp_scale = torch.ones(self.num_envs, 1, device=self.device)
+        self.current_kd_scale = torch.ones(self.num_envs, 1, device=self.device)
+
+        # ---- Proprioception history buffer (for future student distillation) ----
+        # Each history step: joint_pos(20) + joint_vel(20) = 40
+        self._prop_dim = self.num_actuated * 2  # pos + vel = 40
+        self.obs_history = torch.zeros(
+            self.num_envs, self.cfg.num_obs_history, self._prop_dim, device=self.device
+        )  # (N, H, 40)
+
         # Base hand orientation and position (from config, before randomization)
         self.base_hand_quat = torch.tensor(
             self.cfg.robot_cfg.init_state.rot, dtype=torch.float32, device=self.device
@@ -142,6 +156,21 @@ class WujiInHandRotationEnv(DirectRLEnv):
         self.prev_object_quat = torch.zeros((self.num_envs, 4), device=self.device)
         self.prev_object_quat[:, 0] = 1.0  # identity quaternion (w, x, y, z)
 
+        # Sharpa-style reward buffers
+        self.object_pos_prev = torch.zeros((self.num_envs, 3), device=self.device)
+        self.object_default_pos_w = torch.zeros((self.num_envs, 3), device=self.device)
+        # External force buffer (applied to object root, world frame)
+        self.rb_forces = torch.zeros((self.num_envs, 3), device=self.device)
+
+        # Initialize gravity curriculum (set low initial gravity)
+        if self.cfg.gravity_curriculum:
+            import isaaclab.sim as sim_utils_init
+            import carb
+            self.physics_sim_view = sim_utils_init.SimulationContext.instance().physics_sim_view
+            init_g = -float(self.cfg.gravity_curriculum_init)
+            self.physics_sim_view.set_gravity(carb.Float3(0.0, 0.0, init_g))
+            print(f"[gravity_curriculum] initial gravity set to {init_g:.3f} m/s^2")
+
     # ------------------------------------------------------------------ #
     # Scene setup
     # ------------------------------------------------------------------ #
@@ -166,42 +195,52 @@ class WujiInHandRotationEnv(DirectRLEnv):
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         self.prev_actions[:] = self.actions
         self.actions = actions.clone().clamp(-1.0, 1.0)
-        # Snapshot current object quaternion BEFORE physics step advances it
-        # (used later to compute real angular velocity from quaternion change)
+        # Snapshot object pose BEFORE physics advances
         self.prev_object_quat[:] = self.object.data.root_quat_w
+        self.object_pos_prev[:] = self.object.data.root_pos_w
+
+        # Random external forces on object (Sharpa: sharpa_wave_env.py:189-196)
+        if self.cfg.force_scale > 0.0:
+            decay = self.cfg.force_decay ** (self.cfg.sim.dt * self.cfg.decimation / self.cfg.force_decay_interval)
+            self.rb_forces *= decay
+            obj_mass = self.object.root_physx_view.get_masses().reshape(self.num_envs).to(self.device)
+            prob = self.cfg.random_force_prob_scalar
+            apply_mask = torch.rand(self.num_envs, device=self.device) < prob
+            new_forces = torch.randn(self.num_envs, 3, device=self.device) * obj_mass.unsqueeze(-1) * self.cfg.force_scale
+            self.rb_forces = torch.where(apply_mask.unsqueeze(-1), new_forces, self.rb_forces)
+            self.object.set_external_force_and_torque(
+                forces=self.rb_forces.unsqueeze(1),
+                torques=torch.zeros(self.num_envs, 1, 3, device=self.device),
+            )
 
     def _apply_action(self) -> None:
-        # Ramp from open init pose to tight grasp pose over warmup period
+        # Warmup: ramp from open base pose to tight grasp pose over the first N steps.
+        # During warmup we OVERWRITE prev_targets to the ramped pose so the policy delta
+        # is added on top of the gradually closing grasp (avoids penetration shock).
         warmup_frac = torch.clamp(
             self.episode_length_buf.float() / self.squeeze_warmup_steps, 0.0, 1.0
         ).unsqueeze(-1)  # (N, 1)
-        current_grasp_ref = self.grasp_base_pos + (self.grasp_ref_pos - self.grasp_base_pos) * warmup_frac
-
-        # Asymmetric full-range: action=0 → grasp_ref, action=+1 → upper_limit, action=-1 → lower_limit
-        lower = self.hand_dof_lower_limits[:, self.actuated_dof_indices]
-        upper = self.hand_dof_upper_limits[:, self.actuated_dof_indices]
-        pos_action = torch.relu(self.actions)   # [0,1] portion — moves toward upper limit
-        neg_action = torch.relu(-self.actions)  # [0,1] portion — moves toward lower limit
-        desired = (current_grasp_ref
-                   + pos_action * (upper - current_grasp_ref)
-                   - neg_action * (current_grasp_ref - lower))
-
-        # Apply EMA smoothing
-        self.cur_targets[:, self.actuated_dof_indices] = (
-            self.cfg.act_moving_average * desired
-            + (1.0 - self.cfg.act_moving_average) * self.prev_targets[:, self.actuated_dof_indices]
+        ramped_grasp = self.grasp_base_pos + (self.grasp_ref_pos - self.grasp_base_pos) * warmup_frac
+        in_warmup = (warmup_frac < 1.0)  # (N, 1)
+        # During warmup: prev_targets follows the ramp; after warmup: pure delta accumulation.
+        self.prev_targets[:, self.actuated_dof_indices] = torch.where(
+            in_warmup,
+            ramped_grasp,
+            self.prev_targets[:, self.actuated_dof_indices],
         )
 
-        # Clamp to joint limits
+        # Delta action: target = prev_target + action_scale * action  (Sharpa-style)
+        delta = self.cfg.action_scale * self.actions
         self.cur_targets[:, self.actuated_dof_indices] = saturate(
-            self.cur_targets[:, self.actuated_dof_indices],
+            self.prev_targets[:, self.actuated_dof_indices] + delta,
             self.hand_dof_lower_limits[:, self.actuated_dof_indices],
             self.hand_dof_upper_limits[:, self.actuated_dof_indices],
         )
 
+        # Update prev_targets for next step's accumulation
         self.prev_targets[:, self.actuated_dof_indices] = self.cur_targets[:, self.actuated_dof_indices]
 
-        # Send position targets to PD controller
+        # Send absolute position targets to PD controller
         self.hand.set_joint_position_target(
             self.cur_targets[:, self.actuated_dof_indices],
             joint_ids=self.actuated_dof_indices,
@@ -214,33 +253,51 @@ class WujiInHandRotationEnv(DirectRLEnv):
     def _get_observations(self) -> dict:
         self._compute_intermediate_values()
 
+        # -- Proprioception (available on real hardware) --
+        norm_joint_pos = _unscale(
+            self.hand_dof_pos[:, self.actuated_dof_indices],
+            self.hand_dof_lower_limits[:, self.actuated_dof_indices],
+            self.hand_dof_upper_limits[:, self.actuated_dof_indices],
+        )
+        # Sharpa-style joint observation noise (sharpa_wave_env.py: noise_scale=0.02)
+        if self.cfg.joint_obs_noise > 0.0:
+            norm_joint_pos = norm_joint_pos + torch.randn_like(norm_joint_pos) * self.cfg.joint_obs_noise
+        scaled_joint_vel = self.cfg.vel_obs_scale * self.hand_dof_vel[:, self.actuated_dof_indices]
+
+        # Update proprioception history: shift left, append current
+        current_prop = torch.cat([norm_joint_pos, scaled_joint_vel], dim=-1)  # (N, 40)
+        self.obs_history[:, :-1] = self.obs_history[:, 1:].clone()
+        self.obs_history[:, -1] = current_prop
+
+        # -- Actor observation (proprioception + privileged object state) --
         obs = torch.cat(
             [
-                # Hand joint positions (normalized to [-1, 1])
-                _unscale(
-                    self.hand_dof_pos[:, self.actuated_dof_indices],
-                    self.hand_dof_lower_limits[:, self.actuated_dof_indices],
-                    self.hand_dof_upper_limits[:, self.actuated_dof_indices],
-                ),
-                # Hand joint velocities (scaled)
-                self.cfg.vel_obs_scale * self.hand_dof_vel[:, self.actuated_dof_indices],
-                # Previous actions
-                self.prev_actions,
-                # Object position relative to palm (env-local)
-                self.object_pos_local,
-                # Object rotation (quaternion)
-                self.object_rot,
-                # Object linear velocity
-                self.cfg.vel_obs_scale * self.object_linvel,
-                # Object angular velocity
-                self.cfg.vel_obs_scale * self.object_angvel,
-                # Target rotation axis
-                self.target_axis,
+                norm_joint_pos,                                    # 20
+                scaled_joint_vel,                                  # 20
+                self.prev_actions,                                 # 20
+                self.object_pos_local,                             # 3  (privileged)
+                self.object_rot,                                   # 4  (privileged)
+                self.cfg.vel_obs_scale * self.object_linvel,       # 3  (privileged)
+                self.cfg.vel_obs_scale * self.object_angvel,       # 3  (privileged)
+                self.target_axis,                                  # 3
             ],
             dim=-1,
-        )
+        )  # Total: 76
 
-        return {"policy": obs}
+        # -- Critic state (actor obs + DR privileged info) --
+        critic_state = torch.cat(
+            [
+                obs,                          # 76
+                self.current_object_mass,     # 1
+                self.current_object_friction, # 1
+                self.current_com_offset,      # 3
+                self.current_kp_scale,        # 1
+                self.current_kd_scale,        # 1
+            ],
+            dim=-1,
+        )  # Total: 83
+
+        return {"policy": obs, "critic": critic_state}
 
     # ------------------------------------------------------------------ #
     # Rewards
@@ -252,29 +309,37 @@ class WujiInHandRotationEnv(DirectRLEnv):
         vel = self.hand_dof_vel[:, self.actuated_dof_indices]
         estimated_torque = self.kp_vec * pos_error - self.kd_vec * vel
 
+        step_dt = self.cfg.sim.dt * self.cfg.decimation
+        default_dof_pos_actuated = self.hand.data.default_joint_pos[:, self.actuated_dof_indices]
         total, components = _compute_rewards(
             object_angvel=self.object_angvel,
-            object_linvel=self.object_linvel,
+            object_pos=self.object.data.root_pos_w,
+            object_pos_prev=self.object_pos_prev,
+            object_default_pos=self.object_default_pos_w,
             target_axis=self.target_axis,
-            target_angular_velocity=self.cfg.target_angular_velocity,
+            angvel_clip_min=self.cfg.angvel_clip_min,
+            angvel_clip_max=self.cfg.angvel_clip_max,
             hand_dof_pos_actuated=self.hand_dof_pos[:, self.actuated_dof_indices],
-            grasp_ref_pos=self.grasp_ref_pos,
+            default_dof_pos_actuated=default_dof_pos_actuated,
             hand_dof_vel_actuated=vel,
             estimated_torque=estimated_torque,
+            step_dt=step_dt,
             rew_rotation_scale=self.cfg.rew_rotation_scale,
-            rew_vel_penalty=self.cfg.rew_vel_penalty,
-            rew_work_penalty=self.cfg.rew_work_penalty,
-            rew_torque_penalty=self.cfg.rew_torque_penalty,
-            rew_pose_deviation_penalty=self.cfg.rew_pose_deviation_penalty,
+            rew_linvel_penalty_scale=self.cfg.rew_linvel_penalty_scale,
+            rew_pos_diff_scale=self.cfg.rew_pos_diff_scale,
+            rew_torque_scale=self.cfg.rew_torque_scale,
+            rew_work_scale=self.cfg.rew_work_scale,
+            rew_object_pos_scale=self.cfg.rew_object_pos_scale,
         )
         # Log reward components to extras for tensorboard
         self.extras["log"] = {
             "rew_rotation": components[0].mean(),
-            "rew_vel_penalty": components[1].mean(),
-            "rew_work_penalty": components[2].mean(),
+            "rew_linvel_penalty": components[1].mean(),
+            "rew_pos_diff": components[2].mean(),
             "rew_torque_penalty": components[3].mean(),
-            "rew_pose_deviation": components[4].mean(),
-            "angvel_on_axis": components[5].mean(),
+            "rew_work_penalty": components[4].mean(),
+            "rew_object_pos_bonus": components[5].mean(),
+            "angvel_on_axis": components[6].mean(),
         }
         return total
 
@@ -284,6 +349,20 @@ class WujiInHandRotationEnv(DirectRLEnv):
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         self._compute_intermediate_values()
+
+        # Gravity curriculum: increase gravity once policy can hold the ball
+        if self.cfg.gravity_curriculum and hasattr(self, "physics_sim_view") and self.common_step_counter > 1000:
+            # Use drop rate as success signal: if drops are rare, increase gravity
+            dist = torch.norm(self.object_pos_local - self.object_init_pos_local, dim=-1)
+            drop_rate = (dist > self.cfg.fall_dist).float().mean().item()
+            if drop_rate < 1e-2:
+                g = self.physics_sim_view.get_gravity()
+                g_amp = (g[0] ** 2 + g[1] ** 2 + g[2] ** 2) ** 0.5
+                if g_amp < self.cfg.gravity_curriculum_max:
+                    new_g_z = -(g_amp + self.cfg.gravity_curriculum_step)
+                    import carb
+                    self.physics_sim_view.set_gravity(carb.Float3(0.0, 0.0, new_g_z))
+                    print(f"[gravity_curriculum] gravity → {new_g_z:.3f} m/s^2")
 
         # Object dropped: distance from initial pos exceeds threshold
         dist_from_init = torch.norm(self.object_pos_local - self.object_init_pos_local, dim=-1)
@@ -394,6 +473,12 @@ class WujiInHandRotationEnv(DirectRLEnv):
         # ---- Update object init position for drop detection (varies per-env with hand rotation) ----
         self.object_init_pos_local[env_ids] = ball_world_pos + pos_noise
 
+        # Sharpa-style reward buffers: snapshot world-frame default pose
+        self.object_default_pos_w[env_ids] = object_default_state[:, 0:3]
+        self.object_pos_prev[env_ids] = object_default_state[:, 0:3]
+        # Clear external forces for reset envs
+        self.rb_forces[env_ids] = 0.0
+
         # ---- DR: helper for env_ids on CPU ----
         env_ids_cpu = torch.tensor(env_ids, device="cpu") if not isinstance(env_ids, torch.Tensor) else env_ids.cpu()
 
@@ -423,6 +508,7 @@ class WujiInHandRotationEnv(DirectRLEnv):
             rand_mass = sample_uniform(lo, hi, (num_resets, 1), device=masses.device)
             masses[env_ids_cpu] = rand_mass
             self.object.root_physx_view.set_masses(masses, env_ids_cpu)
+            self.current_object_mass[env_ids] = rand_mass.to(self.device)
 
         # ---- DR: randomize object friction ----
         if self.cfg.object_friction_range is not None:
@@ -433,6 +519,7 @@ class WujiInHandRotationEnv(DirectRLEnv):
             mat_props[env_ids_cpu, :, 0] = rand_friction.squeeze(-1)  # static friction
             mat_props[env_ids_cpu, :, 1] = rand_friction.squeeze(-1)  # dynamic friction (same value)
             self.object.root_physx_view.set_material_properties(mat_props, env_ids_cpu)
+            self.current_object_friction[env_ids] = rand_friction.squeeze(-1).to(self.device)
 
         # ---- DR: randomize object center-of-mass offset ----
         if self.cfg.object_com_offset_range is not None:
@@ -446,6 +533,7 @@ class WujiInHandRotationEnv(DirectRLEnv):
                 com_offset = sample_uniform(lo, hi, (num_resets, 1, 3), device=coms.device)
                 coms[env_ids_cpu, :, :3] = coms[env_ids_cpu, :, :3] + com_offset
             self.object.root_physx_view.set_coms(coms, env_ids_cpu)
+            self.current_com_offset[env_ids] = com_offset.reshape(num_resets, 3).to(self.device)
 
         # ---- DR: randomize gravity ----
         if self.cfg.gravity_range is not None:
@@ -471,10 +559,16 @@ class WujiInHandRotationEnv(DirectRLEnv):
             # Also update torque estimation vectors for reward computation
             self.kp_vec = stiffnesses[:1, self.actuated_dof_indices].to(self.device)
             self.kd_vec = dampings[:1, self.actuated_dof_indices].to(self.device)
+            # Store mean scale for privileged obs
+            self.current_kp_scale[env_ids] = kp_scale.mean(dim=-1, keepdim=True).to(self.device)
+            self.current_kd_scale[env_ids] = kd_scale.mean(dim=-1, keepdim=True).to(self.device)
 
         # ---- Reset action buffers ----
         self.actions[env_ids] = 0.0
         self.prev_actions[env_ids] = 0.0
+
+        # ---- Reset observation history buffer ----
+        self.obs_history[env_ids] = 0.0
 
         # ---- Reset previous quaternion buffer ----
         self.prev_object_quat[env_ids] = object_default_state[:, 3:7]
@@ -583,53 +677,62 @@ def _unscale(x: torch.Tensor, lower: torch.Tensor, upper: torch.Tensor) -> torch
 @torch.jit.script
 def _compute_rewards(
     object_angvel: torch.Tensor,
-    object_linvel: torch.Tensor,
+    object_pos: torch.Tensor,
+    object_pos_prev: torch.Tensor,
+    object_default_pos: torch.Tensor,
     target_axis: torch.Tensor,
-    target_angular_velocity: float,
+    angvel_clip_min: float,
+    angvel_clip_max: float,
     hand_dof_pos_actuated: torch.Tensor,
-    grasp_ref_pos: torch.Tensor,
+    default_dof_pos_actuated: torch.Tensor,
     hand_dof_vel_actuated: torch.Tensor,
     estimated_torque: torch.Tensor,
+    step_dt: float,
     rew_rotation_scale: float,
-    rew_vel_penalty: float,
-    rew_work_penalty: float,
-    rew_torque_penalty: float,
-    rew_pose_deviation_penalty: float,
+    rew_linvel_penalty_scale: float,
+    rew_pos_diff_scale: float,
+    rew_torque_scale: float,
+    rew_work_scale: float,
+    rew_object_pos_scale: float,
 ) -> tuple[torch.Tensor, list[torch.Tensor]]:
-    """Compute reward for in-hand rotation (IMCopilot paper: r_rot + r_vel + r_work + r_torq + r_diff)."""
+    """Sharpa-style in-hand rotation reward (sharpa_wave_env.py:217-248)."""
 
-    # 1. r_rot: rotation tracking reward — Gaussian around target angular velocity
-    #    angvel projected onto target axis; reward peaks when matching target speed
-    angvel_on_axis = torch.sum(object_angvel * target_axis, dim=-1)  # (N,)
-    vel_error = angvel_on_axis - target_angular_velocity
-    rotation_reward = rew_rotation_scale * torch.exp(-0.5 * vel_error * vel_error)
+    # 1. r_rot: angular velocity on target axis, CLAMPED to [-0.5, 0.5]
+    angvel_on_axis = torch.sum(object_angvel * target_axis, dim=-1)
+    rotate_reward = torch.clamp(angvel_on_axis, angvel_clip_min, angvel_clip_max)
 
-    # 2. r_vel: object linear velocity penalty (object should stay still, only rotate)
-    vel_penalty = rew_vel_penalty * torch.sum(object_linvel ** 2, dim=-1)
+    # 2. r_vel: L1 norm of object position change / dt
+    object_linvel_penalty = torch.norm(object_pos - object_pos_prev, p=1, dim=-1) / step_dt
 
-    # 3. r_work: joint work/power penalty = |torque * velocity|
-    joint_work = torch.abs(estimated_torque * hand_dof_vel_actuated)
-    work_penalty = rew_work_penalty * torch.sum(joint_work, dim=-1)
+    # 3. r_diff: pose deviation from DEFAULT joint pos (not grasp_ref)
+    pos_diff_penalty = torch.sum((hand_dof_pos_actuated - default_dof_pos_actuated) ** 2, dim=-1)
 
-    # 4. r_torq: joint torque penalty
-    torque_penalty = rew_torque_penalty * torch.sum(estimated_torque ** 2, dim=-1)
+    # 4. r_torq: sum of squared torques
+    torque_penalty = torch.sum(estimated_torque ** 2, dim=-1)
 
-    # 5. r_diff: pose deviation penalty (stay near grasp reference)
-    pose_deviation = rew_pose_deviation_penalty * torch.sum(
-        (hand_dof_pos_actuated - grasp_ref_pos) ** 2, dim=-1
-    )
+    # 5. r_work: SQUARED sum of (torque * velocity) — note: ((sum)^2), not sum(|.|)
+    work_penalty = torch.sum(estimated_torque * hand_dof_vel_actuated, dim=-1) ** 2
+
+    # 6. r_pos: bonus for staying near initial position (1/(dist+0.001))
+    object_pos_diff = 1.0 / (torch.norm(object_pos - object_default_pos, dim=-1) + 0.001)
 
     total_reward = (
-        rotation_reward
-        + vel_penalty
-        + work_penalty
-        + torque_penalty
-        + pose_deviation
+        rotate_reward * rew_rotation_scale
+        + object_linvel_penalty * rew_linvel_penalty_scale
+        + pos_diff_penalty * rew_pos_diff_scale
+        + torque_penalty * rew_torque_scale
+        + work_penalty * rew_work_scale
+        + object_pos_diff * rew_object_pos_scale
     )
 
     components: list[torch.Tensor] = [
-        rotation_reward, vel_penalty, work_penalty, torque_penalty,
-        pose_deviation, angvel_on_axis,
+        rotate_reward * rew_rotation_scale,
+        object_linvel_penalty * rew_linvel_penalty_scale,
+        pos_diff_penalty * rew_pos_diff_scale,
+        torque_penalty * rew_torque_scale,
+        work_penalty * rew_work_scale,
+        object_pos_diff * rew_object_pos_scale,
+        angvel_on_axis,
     ]
 
     return total_reward, components
